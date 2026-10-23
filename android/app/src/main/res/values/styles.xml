@@ -1,0 +1,11 @@
+<resources>
+    <style name="DriftTheme" parent="android:Theme.DeviceDefault.NoActionBar">
+        <item name="android:windowBackground">@color/bg</item>
+        <item name="android:colorBackground">@color/bg</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:enforceNavigationBarContrast">false</item>
+        <item name="android:enforceStatusBarContrast">false</item>
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+    </style>
+</resources>

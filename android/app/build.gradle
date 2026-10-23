@@ -1,0 +1,58 @@
+plugins {
+    id 'com.android.application'
+}
+
+// ABIs to build the Rust core for. A phone needs only arm64-v8a; add x86_64
+// for the emulator:  ./gradlew assembleDebug -PdriftAbis=arm64-v8a,x86_64
+def abis = (project.findProperty('driftAbis') ?: 'arm64-v8a').toString().split(',').collect { it.trim() }
+def rustDir = file("$rootDir/../rust")
+def jniOut = file("$projectDir/src/main/jniLibs")
+
+// The Rust core is always built in release mode (a debug build of the canvas
+// logic is too slow to judge gestures by). Needs cargo-ndk and an NDK r28+
+// (16 KB page alignment by default).
+def cargoNdk = tasks.register('cargoNdk', Exec) {
+    group = 'build'
+    description = 'Builds libdrift_core.so with cargo-ndk'
+    workingDir rustDir
+    inputs.files(fileTree(dir: rustDir, include: ['src/**', 'Cargo.toml', 'Cargo.lock']))
+    inputs.property('abis', abis.join(','))
+    outputs.dir(jniOut)
+    def args = ['cargo', 'ndk', '--platform', '30']
+    abis.each { args += ['-t', it] }
+    args += ['-o', jniOut.absolutePath, 'build', '--release']
+    commandLine args
+}
+
+android {
+    namespace 'dev.drift.launcher'
+    compileSdk 36
+
+    defaultConfig {
+        applicationId 'dev.drift.launcher'
+        minSdk 30
+        targetSdk 36
+        versionCode 1
+        versionName '0.1.0'
+        ndk { abiFilters(*abis) }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            // Signed with the debug key so the release APK installs without a keystore.
+            signingConfig signingConfigs.debug
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    sourceSets {
+        main { jniLibs.srcDir(tasks.named('cargoNdk')) }  // implicit task dependency
+    }
+}
+
+preBuild.dependsOn 'cargoNdk'

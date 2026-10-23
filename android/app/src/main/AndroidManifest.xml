@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- No permissions on purpose: LauncherApps lists and starts launchable apps
+         without QUERY_ALL_PACKAGES or package-visibility declarations. -->
+
+    <application
+        android:allowBackup="true"
+        android:enableOnBackInvokedCallback="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/DriftTheme">
+
+        <activity
+            android:name=".LauncherActivity"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|keyboardHidden|keyboard|navigation|uiMode"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:resumeWhilePausing="true"
+            android:stateNotNeeded="true"
+            android:taskAffinity=""
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.HOME" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
