@@ -14,12 +14,21 @@ import android.view.ViewGroup;
 import android.view.Window;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
+import android.graphics.Typeface;
+import android.widget.Button;
 import android.widget.FrameLayout;
+import android.widget.LinearLayout;
+import android.widget.ScrollView;
+import android.widget.TextView;
 import android.widget.Toast;
 import android.window.OnBackInvokedCallback;
 import android.window.OnBackInvokedDispatcher;
 
 import java.io.File;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.util.List;
 
 /**
@@ -42,8 +51,27 @@ public final class LauncherActivity extends Activity implements CanvasView.Host,
     private final Runnable saveTask = Native::save;
     private OnBackInvokedCallback backCallback;
 
+    private boolean ready;
+
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
+        installCrashRecorder();
+        String previous = readCrash();
+        if (previous != null) {
+            showCrash(previous);
+            return;
+        }
+        try {
+            setUp();
+            ready = true;
+        } catch (Throwable t) {
+            String text = describe(Thread.currentThread(), t);
+            writeCrash(text);
+            showCrash(text);
+        }
+    }
+
+    private void setUp() {
         Window w = getWindow();
         w.setDecorFitsSystemWindows(false);
         w.setNavigationBarContrastEnforced(false);
@@ -109,6 +137,7 @@ public final class LauncherActivity extends Activity implements CanvasView.Host,
 
     @Override protected void onResume() {
         super.onResume();
+        if (!ready) return;
         Native.resetClock();
         repo.scheduleRefresh();
         canvas.invalidate();
@@ -116,13 +145,16 @@ public final class LauncherActivity extends Activity implements CanvasView.Host,
 
     @Override protected void onPause() {
         // The process can be killed while another app is in front: persist now.
-        saveHandler.removeCallbacks(saveTask);
-        Native.save();
+        if (ready) {
+            saveHandler.removeCallbacks(saveTask);
+            Native.save();
+        }
         super.onPause();
     }
 
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
+        if (!ready) return;
         // Home pressed while the launcher is already showing.
         if (drawer.isShowing()) {
             drawer.hide();
@@ -132,11 +164,11 @@ public final class LauncherActivity extends Activity implements CanvasView.Host,
     }
 
     @Override protected void onDestroy() {
-        repo.stop();
+        if (repo != null) repo.stop();
         if (Build.VERSION.SDK_INT >= 33 && backCallback != null) {
             getOnBackInvokedDispatcher().unregisterOnBackInvokedCallback(backCallback);
         }
-        saveThread.quitSafely();
+        if (saveThread != null) saveThread.quitSafely();
         super.onDestroy();
     }
 
@@ -147,6 +179,7 @@ public final class LauncherActivity extends Activity implements CanvasView.Host,
     }
 
     private void handleBack() {
+        if (!ready) return;
         if (drawer.isShowing()) {
             drawer.hide();
         } else if (Native.onBack()) {
@@ -228,6 +261,79 @@ public final class LauncherActivity extends Activity implements CanvasView.Host,
     @Override public void onClose() {
         Native.drawerClosed();
         canvas.invalidate();
+    }
+
+    // ---- crash report: a home app that dies silently leaves the user with no launcher ----
+
+    private File crashFile() {
+        return new File(getFilesDir(), "crash.txt");
+    }
+
+    private static String describe(Thread t, Throwable e) {
+        StringWriter sw = new StringWriter();
+        PrintWriter pw = new PrintWriter(sw);
+        pw.println("Thread: " + t.getName());
+        pw.println("Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + "), "
+            + Build.MANUFACTURER + " " + Build.MODEL + ", ABIs " + java.util.Arrays.toString(Build.SUPPORTED_ABIS));
+        e.printStackTrace(pw);
+        pw.flush();
+        return sw.toString();
+    }
+
+    private void writeCrash(String text) {
+        try (FileWriter w = new FileWriter(crashFile())) {
+            w.write(text);
+        } catch (IOException ignored) {
+            // nothing more we can do
+        }
+    }
+
+    private void installCrashRecorder() {
+        Thread.UncaughtExceptionHandler prev = Thread.getDefaultUncaughtExceptionHandler();
+        Thread.setDefaultUncaughtExceptionHandler((t, e) -> {
+            writeCrash(describe(t, e));
+            if (prev != null) prev.uncaughtException(t, e);
+        });
+    }
+
+    private String readCrash() {
+        File f = crashFile();
+        if (!f.exists()) return null;
+        try {
+            return new String(java.nio.file.Files.readAllBytes(f.toPath()), java.nio.charset.StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    private void showCrash(String text) {
+        int p = Math.round(16 * getResources().getDisplayMetrics().density);
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        col.setPadding(p, p * 3, p, p * 3);
+        col.setBackgroundColor(0xFF101216);
+        TextView head = new TextView(this);
+        head.setText("Drift crashed. Details (select and copy, or send to the developer):");
+        head.setTextColor(0xFFE5766B);
+        head.setTextSize(15);
+        col.addView(head);
+        TextView body = new TextView(this);
+        body.setText(text);
+        body.setTextColor(0xFFE6E8EC);
+        body.setTextSize(11);
+        body.setTypeface(Typeface.MONOSPACE);
+        body.setTextIsSelectable(true);
+        ScrollView sv = new ScrollView(this);
+        sv.addView(body);
+        col.addView(sv, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+        Button retry = new Button(this);
+        retry.setText("Clear report and retry");
+        retry.setOnClickListener(v -> {
+            crashFile().delete();
+            recreate();
+        });
+        col.addView(retry);
+        setContentView(col);
     }
 
     // ---- helpers ---------------------------------------------------------------

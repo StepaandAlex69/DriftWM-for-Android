@@ -91,9 +91,16 @@ fn str_array(env: &mut JNIEnv, arr: &JObjectArray) -> Vec<String> {
     let n = env.get_array_length(arr).unwrap_or(0);
     (0..n)
         .map(|i| {
-            env.get_object_array_element(arr, i)
-                .map(|o| jstr(env, &JString::from(o)))
-                .unwrap_or_default()
+            match env.get_object_array_element(arr, i) {
+                Ok(o) => {
+                    let js = JString::from(o);
+                    let s = jstr(env, &js);
+                    // Local references are a bounded resource on ART: free each one.
+                    let _ = env.delete_local_ref(js);
+                    s
+                }
+                Err(_) => String::new(),
+            }
         })
         .collect()
 }
@@ -264,7 +271,8 @@ pub extern "system" fn Java_dev_drift_launcher_Native_searchApps(
     };
     for (i, k) in keys.iter().enumerate() {
         if let Ok(s) = env.new_string(k) {
-            let _ = env.set_object_array_element(&arr, i as jint, s);
+            let _ = env.set_object_array_element(&arr, i as jint, &s);
+            let _ = env.delete_local_ref(s);
         }
     }
     arr.into_raw()
