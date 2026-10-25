@@ -22,6 +22,9 @@ The goal of this project is to bring the original project's features and design 
 3. Allow installation from this source if Android asks for permission
 4. Follow the on-screen instructions to install the application
 
+## Requirements
+1. Android 16 or later
+
 ## Download
 
 Get the latest version from [GitHub Releases](../../releases/latest)
