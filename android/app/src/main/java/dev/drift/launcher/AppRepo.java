@@ -123,8 +123,11 @@ final class AppRepo {
             }
             String[] k = keys.toArray(new String[0]);
             String[] l = labels.toArray(new String[0]);
+            java.util.Set<String> pkgs = new java.util.HashSet<>();
+            for (Entry en : map.values()) pkgs.add(en.component.getPackageName());
             main.post(() -> {
                 entries = map;
+                ThumbStore.setKnownPackages(pkgs);
                 Native.setApps(k, l);
                 if (listener != null) listener.onAppsChanged();
             });

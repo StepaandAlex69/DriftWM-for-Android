@@ -41,6 +41,7 @@ public final class LauncherActivity extends Activity implements CanvasView.Host,
 
     private AppRepo repo;
     private IconCache icons;
+    private ThumbCache thumbs;
     private CanvasView canvas;
     private DrawerView drawer;
     private FrameLayout root;
@@ -64,6 +65,7 @@ public final class LauncherActivity extends Activity implements CanvasView.Host,
         try {
             setUp();
             ready = true;
+            offerPreviews();
         } catch (Throwable t) {
             String text = describe(Thread.currentThread(), t);
             writeCrash(text);
@@ -75,12 +77,6 @@ public final class LauncherActivity extends Activity implements CanvasView.Host,
         Window w = getWindow();
         w.setDecorFitsSystemWindows(false);
         w.setNavigationBarContrastEnforced(false);
-        WindowInsetsController ic = w.getInsetsController();
-        if (ic != null) {
-            ic.setSystemBarsAppearance(0,
-                WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS
-                    | WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS);
-        }
 
         File stateFile = new File(getFilesDir(), "workspace.json");
         int loaded = Native.init(stateFile.getAbsolutePath());
@@ -97,7 +93,10 @@ public final class LauncherActivity extends Activity implements CanvasView.Host,
         float density = getResources().getDisplayMetrics().density;
         repo = new AppRepo(this);
         icons = new IconCache(repo, density);
-        canvas = new CanvasView(this, icons);
+        thumbs = new ThumbCache(this);
+        ThumbStore.setListener(thumbs);
+        thumbs.setListener(() -> canvas.invalidate());
+        canvas = new CanvasView(this, icons, thumbs);
         drawer = new DrawerView(this, repo, icons);
         canvas.setHost(this);
         drawer.setCallback(this);
@@ -121,11 +120,14 @@ public final class LauncherActivity extends Activity implements CanvasView.Host,
             Insets sg = wi.getInsets(WindowInsets.Type.systemGestures());
             Insets ime = wi.getInsets(WindowInsets.Type.ime());
             // Keep the dock out of the back-gesture zones at the sides.
+            ThumbStore.cropTop = sb.top;
+            ThumbStore.cropBottom = sb.bottom;
             canvas.setInsets(Math.max(sb.left, sg.left), sb.top, Math.max(sb.right, sg.right), sb.bottom);
             drawer.setInsets(sb.left, sb.top, sb.right, Math.max(sb.bottom, ime.bottom));
             return WindowInsets.CONSUMED;
         });
         setContentView(root);
+        applyBarAppearance();
 
         if (Build.VERSION.SDK_INT >= 33) {
             backCallback = this::handleBack;
@@ -168,6 +170,7 @@ public final class LauncherActivity extends Activity implements CanvasView.Host,
         if (Build.VERSION.SDK_INT >= 33 && backCallback != null) {
             getOnBackInvokedDispatcher().unregisterOnBackInvokedCallback(backCallback);
         }
+        ThumbStore.setListener(null);
         if (saveThread != null) saveThread.quitSafely();
         super.onDestroy();
     }
@@ -228,6 +231,54 @@ public final class LauncherActivity extends Activity implements CanvasView.Host,
             toast("Can't open " + repo.label(key));
             repo.scheduleRefresh();
         }
+    }
+
+    /** Must run after setContentView: before that the window has no decor view (NPE on some Samsung builds). */
+    private void applyBarAppearance() {
+        try {
+            WindowInsetsController ic = getWindow().getInsetsController();
+            if (ic != null) {
+                ic.setSystemBarsAppearance(0,
+                    WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS
+                        | WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS);
+            }
+        } catch (RuntimeException ignored) {
+            // cosmetic only
+        }
+    }
+
+    private static String tr(String en, String ru) {
+        return java.util.Locale.getDefault().getLanguage().equals("ru") ? ru : en;
+    }
+
+    /** One-time (up to three times) explanation of the optional preview service. */
+    private void offerPreviews() {
+        if (ThumbService.isEnabled(this)) return;
+        android.content.SharedPreferences prefs = getSharedPreferences("drift", MODE_PRIVATE);
+        int asked = prefs.getInt("preview_prompts", 0);
+        if (asked >= 3) return;
+        prefs.edit().putInt("preview_prompts", asked + 1).apply();
+        new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle(tr("App previews on cards", "Миниатюры приложений на карточках"))
+            .setMessage(tr(
+                "Android does not let a launcher see other apps. To show what each app looked like when you left it, "
+                    + "Drift needs its optional \"Drift previews\" accessibility service. It only takes a small screenshot "
+                    + "about a second after you use an app, cannot read text, passwords or notifications, "
+                    + "skips apps that block screenshots, and keeps pictures on this phone.\n\n"
+                    + "If the switch is greyed out: App info > menu > Allow restricted settings.",
+                "Android не позволяет лаунчеру видеть другие приложения. Чтобы на карточке было видно, как выглядело "
+                    + "приложение, когда вы из него вышли, Drift нужна необязательная служба «Drift previews» в "
+                    + "специальных возможностях. Она делает небольшой снимок экрана примерно через секунду после "
+                    + "ваших действий в приложении, не читает текст, пароли и уведомления, пропускает приложения, "
+                    + "которые запрещают скриншоты, и хранит картинки только на этом телефоне.\n\n"
+                    + "Если переключатель неактивен: Сведения о приложении > меню > Разрешить ограниченные настройки."))
+            .setPositiveButton(tr("Open settings", "Открыть настройки"), (d, i) ->
+                startActivity(new Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS)))
+            .setNeutralButton(tr("App info", "Сведения о приложении"), (d, i) ->
+                startActivity(new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    android.net.Uri.parse("package:" + getPackageName()))))
+            .setNegativeButton(tr("Not now", "Не сейчас"), null)
+            .show();
     }
 
     private void showDrawer(int slot) {

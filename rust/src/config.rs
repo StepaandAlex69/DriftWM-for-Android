@@ -10,8 +10,8 @@ macro_rules! defaults {
 }
 
 defaults! {
-    d_card_w: f64 = 88.0,
-    d_card_h: f64 = 108.0,
+    d_card_w: f64 = 96.0,
+    d_card_h: f64 = 208.0,
     d_snap_gap: f64 = 12.0,
     d_snap_distance: f64 = 24.0,
     d_snap_break: f64 = 32.0,
@@ -134,7 +134,7 @@ mod tests {
     fn partial_object_keeps_other_defaults() {
         let c: Config = serde_json::from_str(r#"{"drift": 0.9}"#).unwrap();
         assert_eq!(c.drift, 0.9);
-        assert_eq!(c.card_w, 88.0);
+        assert_eq!(c.card_w, 96.0);
     }
 
     #[test]

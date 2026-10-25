@@ -4,6 +4,15 @@
     <!-- No permissions on purpose: LauncherApps lists and starts launchable apps
          without QUERY_ALL_PACKAGES or package-visibility declarations. -->
 
+    <!-- Package visibility (Android 11+): without this only a handful of apps are visible.
+         Declares exactly "apps that have a launcher entry"; no QUERY_ALL_PACKAGES. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
     <application
         android:allowBackup="true"
         android:enableOnBackInvokedCallback="true"
@@ -27,5 +36,20 @@
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </activity>
+
+        <!-- Optional: lets Drift keep a still preview of each app on its card.
+             Disabled until the user switches it on in Accessibility settings. -->
+        <service
+            android:name=".ThumbService"
+            android:exported="true"
+            android:label="@string/thumb_service_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/thumb_service" />
+        </service>
     </application>
 </manifest>

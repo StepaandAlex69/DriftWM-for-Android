@@ -5,6 +5,7 @@ import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.DashPathEffect;
 import android.graphics.Paint;
+import android.graphics.Path;
 import android.graphics.RectF;
 import android.os.SystemClock;
 import android.view.MotionEvent;
@@ -61,6 +62,7 @@ final class CanvasView extends View {
 
     private final float density;
     private final IconCache icons;
+    private final ThumbCache thumbs;
     private Host host;
 
     private float[] list = new float[4096];
@@ -85,10 +87,13 @@ final class CanvasView extends View {
     private final Paint bitmapPaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
     private final RectF r = new RectF();
     private final RectF r2 = new RectF();
+    private final android.graphics.Rect srcRect = new android.graphics.Rect();
+    private final Path path = new Path();
 
-    CanvasView(Context context, IconCache icons) {
+    CanvasView(Context context, IconCache icons, ThumbCache thumbs) {
         super(context);
         this.icons = icons;
+        this.thumbs = thumbs;
         density = context.getResources().getDisplayMetrics().density;
         setFocusable(true);
         setFocusableInTouchMode(false);
@@ -313,24 +318,51 @@ final class CanvasView extends View {
         String key = idx >= 0 && idx < keys.size() ? keys.get(idx) : null;
         String label = idx >= 0 && idx < labels.size() ? labels.get(idx) : "";
 
-        float iconSize = w * 0.56f;
-        float ix = x + (w - iconSize) / 2f;
-        float iy = y + h * 0.12f;
         int alpha = unavailable ? 90 : 255;
+        Bitmap shot = key == null ? null : thumbs.get(ThumbStore.packageOf(key));
         Bitmap icon = key == null ? null : icons.get(key);
-        if (icon != null) {
-            bitmapPaint.setAlpha(alpha);
-            r2.set(ix, iy, ix + iconSize, iy + iconSize);
-            c.drawBitmap(icon, null, r2, bitmapPaint);
+        if (shot != null) {
+            drawPreview(c, shot, x, y, w, h, rad, alpha);
+            // Small icon badge and a label strip keep the app identifiable.
+            float badge = Math.min(w * 0.26f, 26f);
+            if (icon != null && badge >= 8f) {
+                fill.setColor(0xCC101216);
+                c.drawCircle(x + badge * 0.85f, y + badge * 0.85f, badge * 0.78f, fill);
+                bitmapPaint.setAlpha(alpha);
+                r2.set(x + badge * 0.2f, y + badge * 0.2f, x + badge * 1.5f, y + badge * 1.5f);
+                c.drawBitmap(icon, null, r2, bitmapPaint);
+            }
+            float ts = Math.min(h * 0.075f, w * 0.14f);
+            if (ts >= 6.5f) {
+                float strip = ts * 2.1f;
+                r2.set(x, y + h - strip, x + w, y + h);
+                fill.setColor(0xB0101216);
+                c.save();
+                path.rewind();
+                path.addRoundRect(r, rad, rad, Path.Direction.CW);
+                c.clipPath(path);
+                c.drawRect(r2, fill);
+                c.restore();
+                drawLabel(c, label, x, w, y + h - strip + ts * 1.45f, ts, unavailable ? TEXT_DIM : TEXT);
+            }
         } else {
-            fill.setColor(0xFF3A404C);
-            c.drawCircle(ix + iconSize / 2f, iy + iconSize / 2f, iconSize / 2f, fill);
-        }
-
-        float ts = h * 0.125f;
-        if (ts >= 6.5f) {
-            float ty = iy + iconSize + ts * 1.45f;
-            drawLabel(c, label, x, w, ty, ts, unavailable ? TEXT_DIM : TEXT);
+            // No preview captured yet: icon + name, centered.
+            float iconSize = Math.min(w * 0.56f, h * 0.56f);
+            float ix = x + (w - iconSize) / 2f;
+            float ts = Math.min(h * 0.125f, w * 0.14f);
+            float block = iconSize + (ts >= 6.5f ? ts * 1.9f : 0f);
+            float iy = y + (h - block) / 2f;
+            if (icon != null) {
+                bitmapPaint.setAlpha(alpha);
+                r2.set(ix, iy, ix + iconSize, iy + iconSize);
+                c.drawBitmap(icon, null, r2, bitmapPaint);
+            } else {
+                fill.setColor(0xFF3A404C);
+                c.drawCircle(ix + iconSize / 2f, iy + iconSize / 2f, iconSize / 2f, fill);
+            }
+            if (ts >= 6.5f) {
+                drawLabel(c, label, x, w, iy + iconSize + ts * 1.45f, ts, unavailable ? TEXT_DIM : TEXT);
+            }
         }
         if (unavailable) {
             // Uninstalled/disabled app: keep the card, mark it, let the user remove it.
@@ -346,6 +378,31 @@ final class CanvasView extends View {
             c.drawLine(cx - s, cy - s, cx + s, cy + s, stroke);
             c.drawLine(cx - s, cy + s, cx + s, cy - s, stroke);
         }
+    }
+
+    /** Draws the preview center-cropped (top-aligned) into the card, clipped to its rounded rect. */
+    private void drawPreview(Canvas c, Bitmap shot, float x, float y, float w, float h, float rad, int alpha) {
+        float bw = shot.getWidth();
+        float bh = shot.getHeight();
+        float cardAspect = w / h;
+        int sw;
+        int sh;
+        if (bw / bh > cardAspect) { // image wider than the card: trim the sides
+            sh = (int) bh;
+            sw = Math.max(1, Math.round(bh * cardAspect));
+        } else { // taller than the card: keep the top, trim the bottom
+            sw = (int) bw;
+            sh = Math.max(1, Math.round(bw / cardAspect));
+        }
+        srcRect.set((int) ((bw - sw) / 2f), 0, (int) ((bw - sw) / 2f) + sw, sh);
+        r2.set(x, y, x + w, y + h);
+        c.save();
+        path.rewind();
+        path.addRoundRect(r2, rad, rad, Path.Direction.CW);
+        c.clipPath(path);
+        bitmapPaint.setAlpha(alpha);
+        c.drawBitmap(shot, srcRect, r2, bitmapPaint);
+        c.restore();
     }
 
     /** Single-line label; ellipsized without allocating. */
