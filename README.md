@@ -16,7 +16,11 @@ The goal of this project is to bring the original project's features and design 
 
 ## Requirements
 
-- Android 16 or later
+- **Minimum:** Android 11 (API 30)
+- **Recommended:** Android 16 (API 36)
+- **Target SDK:** 36
+
+Android 11 and newer are supported, but Android 16 is recommended for the best experience
 
 ## Installation and Setup
 
