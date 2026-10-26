@@ -38,6 +38,7 @@ final class CanvasView extends View {
     private static final int CARD_DRAGGING = 2;
     private static final int CARD_UNAVAILABLE = 4;
     private static final int CARD_SNAP = 8 | 16;
+    private static final int CARD_NO_PREVIEW = 32;
 
     private static final int UI_PRESSED = 1;
     private static final int UI_FILLED = 2;
@@ -58,7 +59,7 @@ final class CanvasView extends View {
         0xFFE5766B, 0xFFE8B05C, 0xFF8FCB6A, 0xFF5DBFB4, 0xFF6C9BE8, 0xFFB58CE0
     };
 
-    private static final String[] TOOL_LABEL = {"Center", "Group", "Pin", "Remove"};
+    private static final String[] TOOL_LABEL = {"Center", "Group", "Pin", "Remove", "Preview"};
 
     private final float density;
     private final IconCache icons;
@@ -319,7 +320,7 @@ final class CanvasView extends View {
         String label = idx >= 0 && idx < labels.size() ? labels.get(idx) : "";
 
         int alpha = unavailable ? 90 : 255;
-        Bitmap shot = key == null ? null : thumbs.get(ThumbStore.packageOf(key));
+        Bitmap shot = key == null || (flags & CARD_NO_PREVIEW) != 0 ? null : thumbs.get(ThumbStore.packageOf(key));
         Bitmap icon = key == null ? null : icons.get(key);
         if (shot != null) {
             drawPreview(c, shot, x, y, w, h, rad, alpha);
@@ -456,8 +457,11 @@ final class CanvasView extends View {
                 case 3:
                     drawNavButton(c, kind, pressed);
                     break;
+                case 9:
+                    drawCardButton(c, (flags & UI_FILLED) != 0);
+                    break;
                 default:
-                    drawTool(c, kind - 4, pressed);
+                    drawTool(c, kind - 4, pressed, (flags & UI_FILLED) != 0);
                     break;
             }
         }
@@ -553,16 +557,48 @@ final class CanvasView extends View {
         }
     }
 
-    private void drawTool(Canvas c, int tool, boolean pressed) {
+    private void drawTool(Canvas c, int tool, boolean pressed, boolean on) {
         fill.setColor(pressed ? 0xF0303541 : 0xF01A1D23);
         float rad = r.height() / 2f;
         c.drawRoundRect(r, rad, rad, fill);
-        stroke.setColor(tool == 3 ? 0xFFE5766B : STROKE);
+        boolean remove = tool == 3;
+        boolean preview = tool == 4;
+        int accent = remove ? 0xFFE5766B : (preview ? (on ? ACCENT : TEXT_DIM) : TEXT);
+        stroke.setColor(remove ? 0xFFE5766B : (preview && on ? ACCENT : STROKE));
         stroke.setStrokeWidth(1f);
         c.drawRoundRect(r, rad, rad, stroke);
         centered.setTextSize(12f);
-        centered.setColor(tool == 3 ? 0xFFE5766B : TEXT);
-        c.drawText(TOOL_LABEL[tool], r.centerX(), r.centerY() + 4.2f, centered);
+        centered.setColor(accent);
+        float ty = r.centerY() + 4.2f;
+        c.drawText(TOOL_LABEL[tool], r.centerX(), ty, centered);
+        if (preview && !on) {
+            // Preview hidden for this card: strike the label through.
+            float half = centered.measureText(TOOL_LABEL[tool]) / 2f;
+            stroke.setColor(TEXT_DIM);
+            stroke.setStrokeWidth(1.4f);
+            c.drawLine(r.centerX() - half, ty - 3.6f, r.centerX() + half, ty - 3.6f, stroke);
+        }
         centered.setColor(TEXT);
+    }
+
+    /** Round "eye" button in the selected card's top-right corner: tap to show/hide its preview. */
+    private void drawCardButton(Canvas c, boolean on) {
+        float cx = r.centerX(), cy = r.centerY(), rad = r.width() / 2f;
+        fill.setColor(0xE6101216);
+        c.drawCircle(cx, cy, rad, fill);
+        int color = on ? ACCENT : TEXT_DIM;
+        stroke.setColor(color);
+        stroke.setStrokeWidth(1.6f);
+        c.drawCircle(cx, cy, rad, stroke);
+        float ew = rad * 0.62f, eh = rad * 0.36f;
+        r2.set(cx - ew, cy - eh, cx + ew, cy + eh);
+        c.drawOval(r2, stroke);
+        fill.setColor(color);
+        c.drawCircle(cx, cy, rad * 0.17f, fill);
+        if (!on) {
+            float d = rad * 0.5f;
+            stroke.setStrokeWidth(2f);
+            c.drawLine(cx - d, cy + d, cx + d, cy - d, stroke);
+        }
     }
 }
