@@ -17,6 +17,10 @@ use crate::workspace::{
     find_nearest, visible_fraction, zoom_to_fit,
 };
 
+pub const CARD_BUTTON: f64 = 28.0;
+const CARD_BUTTON_INSET: f64 = 5.0;
+const CARD_BUTTON_MIN_CARD: f64 = 52.0;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Card {
     pub id: u64,
@@ -25,6 +29,8 @@ pub struct Card {
     pub rect: Rect,
     /// False when the app is no longer launchable (uninstalled, disabled, profile gone).
     pub available: bool,
+    /// Draw the captured app preview on the card (false: icon and name only).
+    pub preview: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,6 +157,7 @@ impl Launcher {
                 label: c.label,
                 rect: Rect::new(c.x, c.y, c.w, c.h),
                 available: true,
+                preview: c.preview,
             });
         }
         for key in &saved.recents {
@@ -184,6 +191,7 @@ impl Launcher {
                 y: c.rect.y,
                 w: c.rect.w,
                 h: c.rect.h,
+                preview: c.preview,
             })
             .collect();
         s.dock = self.dock.clone();
@@ -470,6 +478,35 @@ impl Launcher {
         }
     }
 
+    /// Show or hide the app preview on one card.
+    pub fn toggle_preview(&mut self, id: u64) {
+        if let Some(i) = self.card_index(id) {
+            self.cards[i].preview = !self.cards[i].preview;
+            self.emit(Event::Save);
+        }
+    }
+
+    /// The round preview button on the selected card: id and screen rect (dp).
+    /// Hidden when the card is too small on screen to carry a 28 dp button.
+    pub fn card_button(&self) -> Option<(u64, Rect)> {
+        let c = self.card(self.selected?)?;
+        let tl = self.camera.canvas_to_screen(Vec2::new(c.rect.x, c.rect.y));
+        let w = c.rect.w * self.camera.zoom;
+        let h = c.rect.h * self.camera.zoom;
+        if w < CARD_BUTTON_MIN_CARD || h < CARD_BUTTON_MIN_CARD {
+            return None;
+        }
+        Some((
+            c.id,
+            Rect::new(
+                tl.x + w - CARD_BUTTON - CARD_BUTTON_INSET,
+                tl.y + CARD_BUTTON_INSET,
+                CARD_BUTTON,
+                CARD_BUTTON,
+            ),
+        ))
+    }
+
     pub fn is_installed(&self, key: &str) -> bool {
         self.apps.iter().any(|a| a.key == key)
     }
@@ -552,6 +589,7 @@ impl Launcher {
             label: app.label,
             rect: Rect::new(pos.x, pos.y, self.cfg.card_w, self.cfg.card_h),
             available: true,
+            preview: true,
         });
         self.geometry_changed();
         self.bump_layout();
@@ -868,9 +906,9 @@ mod tests {
     fn fit_group_covers_whole_cluster() {
         let mut l = launcher();
         l.cards = vec![
-            Card { id: 1, key: "a".into(), label: "A".into(), rect: Rect::new(0.0, 0.0, 88.0, 108.0), available: true },
-            Card { id: 2, key: "b".into(), label: "B".into(), rect: Rect::new(100.0, 0.0, 88.0, 108.0), available: true },
-            Card { id: 3, key: "c".into(), label: "C".into(), rect: Rect::new(5000.0, 0.0, 88.0, 108.0), available: true },
+            Card { id: 1, key: "a".into(), label: "A".into(), rect: Rect::new(0.0, 0.0, 88.0, 108.0), available: true, preview: true },
+            Card { id: 2, key: "b".into(), label: "B".into(), rect: Rect::new(100.0, 0.0, 88.0, 108.0), available: true, preview: true },
+            Card { id: 3, key: "c".into(), label: "C".into(), rect: Rect::new(5000.0, 0.0, 88.0, 108.0), available: true, preview: true },
         ];
         l.fit_group(1);
         for t in (0..200).map(|i| i * 16) {

@@ -26,6 +26,13 @@ pub struct CardRecord {
     pub y: f64,
     pub w: f64,
     pub h: f64,
+    /// Show the captured app preview on this card (false: icon and name only).
+    #[serde(default = "default_true")]
+    pub preview: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -229,7 +236,8 @@ mod tests {
                 y: -20.0,
                 w: 96.0,
                 h: 112.0,
-            },
+            preview: true,
+        },
             CardRecord {
                 key: "com.b".into(),
                 label: "B".into(),
@@ -237,7 +245,8 @@ mod tests {
                 y: -20.0,
                 w: 96.0,
                 h: 112.0,
-            },
+            preview: true,
+        },
         ];
         s.dock.assign(0, "com.a");
         s.recents = vec!["com.b".into(), "com.a".into()];
@@ -348,6 +357,7 @@ mod tests {
             y: 0.0,
             w: 10.0,
             h: 10.0,
+            preview: true,
         });
         s.cards.push(CardRecord {
             key: "com.nan".into(),
@@ -356,6 +366,7 @@ mod tests {
             y: 0.0,
             w: 10.0,
             h: 10.0,
+            preview: true,
         });
         s.cards.push(CardRecord {
             key: "com.zero".into(),
@@ -364,6 +375,7 @@ mod tests {
             y: 0.0,
             w: 0.0,
             h: 10.0,
+            preview: true,
         });
         sanitize(&mut s);
         assert_eq!(s.cards.len(), 2);

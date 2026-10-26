@@ -15,6 +15,10 @@ pub enum UiId {
     ToolGroup,
     ToolPin,
     ToolRemove,
+    /// Show/hide the app preview on the selected card (toolbar).
+    ToolPreview,
+    /// Round button in the selected card's top-right corner (not part of `layout`).
+    CardPreview,
 }
 
 impl UiId {
@@ -28,6 +32,8 @@ impl UiId {
             UiId::ToolGroup => "group",
             UiId::ToolPin => "pin",
             UiId::ToolRemove => "remove",
+            UiId::ToolPreview => "preview",
+            UiId::CardPreview => "cardpreview",
         }
     }
 }
@@ -61,7 +67,7 @@ const PILL_PAD: f64 = 6.0;
 const SLOT_GAP: f64 = 4.0;
 const MAX_SLOT: f64 = 60.0;
 const NAV_BTN: f64 = 40.0;
-const TOOL_W: f64 = 68.0;
+const TOOL_W: f64 = 64.0;
 const TOOL_H: f64 = 40.0;
 const TOOL_GAP: f64 = 8.0;
 
@@ -112,14 +118,23 @@ pub fn layout(viewport: Vec2, insets: Insets, has_selection: bool) -> UiLayout {
     });
 
     if has_selection {
-        let tools = [UiId::ToolCenter, UiId::ToolGroup, UiId::ToolPin, UiId::ToolRemove];
-        let total = TOOL_W * tools.len() as f64 + TOOL_GAP * (tools.len() as f64 - 1.0);
+        let tools = [
+            UiId::ToolCenter,
+            UiId::ToolGroup,
+            UiId::ToolPreview,
+            UiId::ToolPin,
+            UiId::ToolRemove,
+        ];
+        let n = tools.len() as f64;
+        // Shrink the buttons on narrow screens so the row always fits.
+        let tool_w = ((right - left - TOOL_GAP * (n - 1.0)) / n).clamp(40.0, TOOL_W);
+        let total = tool_w * n + TOOL_GAP * (n - 1.0);
         let x0 = ((viewport.x - total) / 2.0).max(left);
         let y = insets.top + MARGIN;
         for (i, id) in tools.into_iter().enumerate() {
             items.push(UiItem {
                 id,
-                rect: Rect::new(x0 + i as f64 * (TOOL_W + TOOL_GAP), y, TOOL_W, TOOL_H),
+                rect: Rect::new(x0 + i as f64 * (tool_w + TOOL_GAP), y, tool_w, TOOL_H),
             });
         }
     }

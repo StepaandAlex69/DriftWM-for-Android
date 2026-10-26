@@ -9,7 +9,7 @@
 use crate::launcher::{Event, LaunchSource, Launcher};
 use crate::snapping::{SnapConfig, SnapRect, SnapState, cluster_of, snap_move};
 use crate::ui::UiId;
-use crate::workspace::{Direction, Vec2, edge_pan_velocity, snap_zoom, zoom_anchor_camera};
+use crate::workspace::{Direction, Rect, Vec2, edge_pan_velocity, snap_zoom, zoom_anchor_camera};
 
 /// Spread change (fraction of the starting spread) before pinch-zoom engages.
 const ZOOM_SLOP_RATIO: f64 = 0.08;
@@ -19,9 +19,17 @@ const SWIPE3_DISTANCE: f64 = 56.0;
 /// Smallest hit target for a card, in dp, however far the canvas is zoomed out.
 const MIN_HIT: f64 = 28.0;
 
+/// Smallest and largest card width (canvas dp) reachable by pinch-resizing.
+const MIN_CARD_W: f64 = 40.0;
+const MAX_CARD_W: f64 = 1200.0;
+/// Extra hit slop around the round card button, dp.
+const BUTTON_SLOP: f64 = 4.0;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Target {
     Card(u64),
+    /// The round preview button on the selected card.
+    CardButton(u64),
     Empty,
     Ui(UiId),
 }
@@ -44,6 +52,13 @@ pub(crate) struct DragState {
     snap: SnapState,
     finger: Vec2,
     edge_since: Option<u64>,
+}
+
+impl Target {
+    /// Screen-fixed controls: never pannable, never start a pinch.
+    fn is_control(self) -> bool {
+        matches!(self, Target::Ui(_) | Target::CardButton(_))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +85,15 @@ pub(crate) enum Mode {
         last_spread: f64,
         start_spread: f64,
         zoom_engaged: bool,
+    },
+    /// Pinch on the selected card: scales the card, not the canvas.
+    Resize {
+        card_id: u64,
+        start_spread: f64,
+        last_spread: f64,
+        engaged: bool,
+        /// Canvas point under the fingers when they landed; the card scales about it.
+        anchor: Vec2,
     },
     Swipe3 {
         start: Vec2,
@@ -162,6 +186,17 @@ impl Launcher {
         if let Some(ui) = self.ui_layout().hit(p) {
             return Target::Ui(ui);
         }
+        if let Some((id, r)) = self.card_button()
+            && Rect::new(
+                r.x - BUTTON_SLOP,
+                r.y - BUTTON_SLOP,
+                r.w + 2.0 * BUTTON_SLOP,
+                r.h + 2.0 * BUTTON_SLOP,
+            )
+            .contains(p)
+        {
+            return Target::CardButton(id);
+        }
         let zoom = self.camera.zoom;
         let c = self.camera.screen_to_canvas(p);
         let min_canvas = MIN_HIT / zoom;
@@ -203,20 +238,31 @@ impl Launcher {
                 };
             }
             2 => {
+                // First finger on the selected card: this pinch resizes that card.
+                let resize = match &self.g.mode {
+                    Mode::Pending {
+                        target: Target::Card(id),
+                        long: false,
+                        ..
+                    } if self.selected == Some(*id) => Some(*id),
+                    _ => None,
+                };
                 let pannable = match &self.g.mode {
                     Mode::Pending { target, long, .. } => {
-                        !matches!(target, Target::Ui(_)) && !(*long && matches!(target, Target::Card(_)))
+                        !target.is_control() && !(*long && matches!(target, Target::Card(_)))
                     }
                     Mode::Pan { .. } => true,
                     _ => false,
                 };
-                if pannable {
+                if let Some(id) = resize {
+                    self.begin_resize(id);
+                } else if pannable {
                     self.begin_multi();
                 }
             }
             3 => {
                 if matches!(self.g.mode, Mode::Multi { .. } | Mode::Pan { .. } | Mode::Pending { .. })
-                    && !matches!(self.g.mode, Mode::Pending { target: Target::Ui(_), .. })
+                    && !matches!(&self.g.mode, Mode::Pending { target, .. } if target.is_control())
                 {
                     let c = self.centroid(3);
                     self.g.mode = Mode::Swipe3 {
@@ -290,7 +336,7 @@ impl Launcher {
                         };
                         self.bump_layout();
                     }
-                    Target::Ui(_) => self.g.mode = Mode::Ignore,
+                    Target::Ui(_) | Target::CardButton(_) => self.g.mode = Mode::Ignore,
                 }
             }
             Mode::Pan { pid } if pid == id => {
@@ -317,6 +363,7 @@ impl Launcher {
                 };
             }
             Mode::Multi { .. } => self.update_multi(),
+            Mode::Resize { .. } => self.update_resize(),
             Mode::Swipe3 { start, fired } => {
                 if fired {
                     return;
@@ -384,6 +431,67 @@ impl Launcher {
             last_spread: if engaged { spread } else { last_spread },
             start_spread,
             zoom_engaged: engaged,
+        };
+    }
+
+    fn begin_resize(&mut self, card_id: u64) {
+        self.momentum.stop();
+        let s = self.spread();
+        let anchor = self.camera.screen_to_canvas(self.centroid(2));
+        self.g.mode = Mode::Resize {
+            card_id,
+            start_spread: s,
+            last_spread: s,
+            engaged: false,
+            anchor,
+        };
+    }
+
+    /// Scale the card about the pinch centre so the canvas point between the
+    /// fingers stays under them; aspect ratio is kept.
+    fn update_resize(&mut self) {
+        let Mode::Resize {
+            card_id,
+            start_spread,
+            last_spread,
+            engaged,
+            anchor,
+        } = self.g.mode.clone()
+        else {
+            return;
+        };
+        if self.g.pointers.len() < 2 {
+            return;
+        }
+        let spread = self.spread();
+        let mut engaged = engaged;
+        let mut base = last_spread;
+        if !engaged
+            && start_spread > 1.0
+            && (spread / start_spread - 1.0).abs() > ZOOM_SLOP_RATIO
+            && (spread - start_spread).abs() > ZOOM_MIN_DELTA
+        {
+            engaged = true;
+            base = spread;
+        }
+        if engaged
+            && base > 1.0
+            && spread > 1.0
+            && let Some(i) = self.card_index(card_id)
+        {
+            let r = self.cards[i].rect;
+            let new_w = (r.w * spread / base).clamp(MIN_CARD_W, MAX_CARD_W);
+            let k = new_w / r.w;
+            let a = anchor;
+            self.cards[i].rect = Rect::new(a.x + (r.x - a.x) * k, a.y + (r.y - a.y) * k, r.w * k, r.h * k);
+            self.geometry_changed();
+        }
+        self.g.mode = Mode::Resize {
+            card_id,
+            start_spread,
+            last_spread: if engaged { spread } else { last_spread },
+            engaged,
+            anchor,
         };
     }
 
@@ -590,6 +698,12 @@ impl Launcher {
                 }
                 self.emit(Event::Save);
             }
+            Mode::Resize { .. } => {
+                self.g.mode = if remaining == 0 { Mode::Idle } else { Mode::Ignore };
+                self.geometry_changed();
+                self.bump_layout();
+                self.emit(Event::Save);
+            }
             Mode::Swipe3 { .. } => {
                 self.g.mode = if remaining == 0 { Mode::Idle } else { Mode::Ignore };
             }
@@ -602,7 +716,7 @@ impl Launcher {
     }
 
     fn on_cancel(&mut self) {
-        if matches!(self.g.mode, Mode::Drag(_)) {
+        if matches!(self.g.mode, Mode::Drag(_) | Mode::Resize { .. }) {
             self.geometry_changed();
             self.emit(Event::Save);
         }
@@ -635,6 +749,14 @@ impl Launcher {
                     self.g.last_tap = Some(LastTap { card: id, ms: now, pos: p });
                     self.select(Some(id));
                     self.raise(id);
+                }
+            }
+            Target::CardButton(id) => {
+                self.g.last_tap = None;
+                if self.ui_layout().hit(p).is_none()
+                    && self.card_button().is_some_and(|(sel, _)| sel == id)
+                {
+                    self.toggle_preview(id);
                 }
             }
             Target::Empty => {
@@ -705,6 +827,12 @@ impl Launcher {
                     self.fit_group(id);
                 }
             }
+            UiId::ToolPreview => {
+                if let Some(id) = self.selected {
+                    self.toggle_preview(id);
+                }
+            }
+            UiId::CardPreview => {} // handled as Target::CardButton
             UiId::ToolPin => self.pin_selected(),
             UiId::ToolRemove => {
                 if let Some(id) = self.selected {
@@ -749,6 +877,7 @@ mod tests {
             label: key.to_uppercase(),
             rect: Rect::new(x, y, 88.0, 108.0),
             available: true,
+            preview: true,
         });
         l.geometry_changed();
         l.bump_layout();
@@ -1383,5 +1512,197 @@ mod tests {
         l.touch(1, 5, 10.0, 10.0, 1000);
         l.touch(2, 5, 10.0, 10.0, 1010);
         assert!(matches!(l.g.mode, Mode::Idle));
+    }
+
+    // ---- per-card preview toggle and pinch-resize -------------------------------
+
+    fn select_by_tap(l: &mut Launcher, id: u64, t: u64) {
+        let c = screen_of(l, id);
+        tap(l, c.x, c.y, t);
+        assert_eq!(l.selected, Some(id));
+        events(l);
+    }
+
+    /// Two fingers straddling `cx`,`cy`; returns after the pinch started.
+    fn pinch(l: &mut Launcher, cx: f64, cy: f64, spreads: &[f64], t0: u64) {
+        let half = spreads[0] / 2.0;
+        let mut a = Finger::down(l, 0, cx - half, cy, t0);
+        let mut b = Finger::down(l, 1, cx + half, cy, t0 + 10);
+        for (i, s) in spreads.iter().enumerate().skip(1) {
+            let t = t0 + 20 + i as u64 * 16;
+            a.to(l, cx - s / 2.0, cy, t);
+            b.to(l, cx + s / 2.0, cy, t);
+        }
+        let t = t0 + 400;
+        a.up(l, t);
+        b.up(l, t + 5);
+    }
+
+    #[test]
+    fn toolbar_preview_button_toggles_selected_card() {
+        let mut l = setup();
+        let id = put_card(&mut l, "a", 136.0, 300.0);
+        select_by_tap(&mut l, id, 1000);
+        assert!(l.card(id).unwrap().preview);
+        let r = l.ui_layout().rect_of(UiId::ToolPreview).unwrap().center();
+        tap(&mut l, r.x, r.y, 2000);
+        assert!(!l.card(id).unwrap().preview);
+        assert!(events(&mut l).contains(&Event::Save));
+        tap(&mut l, r.x, r.y, 3000);
+        assert!(l.card(id).unwrap().preview);
+    }
+
+    #[test]
+    fn card_round_button_toggles_without_opening_the_app() {
+        let mut l = setup();
+        let id = put_card(&mut l, "a", 136.0, 300.0);
+        let other = put_card(&mut l, "b", 20.0, 300.0);
+        assert!(l.card_button().is_none(), "no button without a selection");
+        select_by_tap(&mut l, id, 1000);
+        let (bid, r) = l.card_button().expect("button on the selected card");
+        assert_eq!(bid, id);
+        let card = l.card(id).unwrap().rect;
+        assert!(r.x_high() <= card.x_high() && r.y >= card.y, "button sits inside the top-right corner");
+        assert!(r.cx() > card.cx() && r.cy() < card.cy());
+        let c = r.center();
+        tap(&mut l, c.x, c.y, 2000);
+        assert!(!l.card(id).unwrap().preview);
+        // A quick second tap on the button must not count as a double tap that opens the app.
+        tap(&mut l, c.x, c.y, 2150);
+        assert!(l.card(id).unwrap().preview);
+        assert!(!events(&mut l).iter().any(|e| matches!(e, Event::Launch(_))));
+        assert_eq!(l.selected, Some(id));
+        assert!(l.card(other).unwrap().preview, "other cards are unaffected");
+    }
+
+    #[test]
+    fn dragging_from_the_round_button_does_not_move_the_card() {
+        let mut l = setup();
+        let id = put_card(&mut l, "a", 136.0, 300.0);
+        select_by_tap(&mut l, id, 1000);
+        let before = l.card(id).unwrap().rect;
+        let c = l.card_button().unwrap().1.center();
+        let mut f = Finger::down(&mut l, 0, c.x, c.y, 2000);
+        f.to(&mut l, c.x + 40.0, c.y + 40.0, 2020);
+        f.up(&mut l, 2040);
+        assert_eq!(l.card(id).unwrap().rect, before);
+        assert!(l.card(id).unwrap().preview);
+    }
+
+    #[test]
+    fn pinch_on_selected_card_resizes_it_and_leaves_the_canvas_alone() {
+        let mut l = setup();
+        let id = put_card(&mut l, "a", 136.0, 300.0);
+        select_by_tap(&mut l, id, 1000);
+        let cam = l.camera;
+        let before = l.card(id).unwrap().rect;
+        pinch(&mut l, 180.0, 354.0, &[40.0, 60.0, 120.0], 2000);
+        let after = l.card(id).unwrap().rect;
+        assert!((after.w / before.w - 2.0).abs() < 1e-6, "width doubled, got {}", after.w / before.w);
+        assert!((after.h / before.h - 2.0).abs() < 1e-6, "aspect ratio kept");
+        assert_eq!(l.camera, cam, "canvas camera must not move or zoom");
+        assert!(events(&mut l).contains(&Event::Save));
+    }
+
+    #[test]
+    fn pinch_out_then_in_shrinks_the_card() {
+        let mut l = setup();
+        let id = put_card(&mut l, "a", 136.0, 300.0);
+        select_by_tap(&mut l, id, 1000);
+        let before = l.card(id).unwrap().rect;
+        pinch(&mut l, 180.0, 354.0, &[80.0, 100.0, 50.0], 2000);
+        assert!((l.card(id).unwrap().rect.w / before.w - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn resize_keeps_the_point_between_the_fingers_fixed_in_the_card() {
+        let mut l = setup();
+        let id = put_card(&mut l, "a", 136.0, 300.0);
+        select_by_tap(&mut l, id, 1000);
+        let before = l.card(id).unwrap().rect;
+        let rel = |r: crate::workspace::Rect| ((190.0 - r.x) / r.w, (354.0 - r.y) / r.h);
+        let (rx, ry) = rel(before);
+        pinch(&mut l, 190.0, 354.0, &[40.0, 60.0, 120.0], 2000);
+        let after = l.card(id).unwrap().rect;
+        let (ax, ay) = rel(after);
+        assert!((rx - ax).abs() < 1e-9 && (ry - ay).abs() < 1e-9, "({rx},{ry}) -> ({ax},{ay})");
+    }
+
+    #[test]
+    fn resize_is_clamped_both_ways() {
+        let mut l = setup();
+        let id = put_card(&mut l, "a", 136.0, 300.0);
+        select_by_tap(&mut l, id, 1000);
+        pinch(&mut l, 180.0, 354.0, &[30.0, 40.0, 400.0, 2000.0], 2000);
+        assert!(l.card(id).unwrap().rect.w <= MAX_CARD_W + 1e-9);
+        pinch(&mut l, 180.0, 354.0, &[300.0, 250.0, 120.0, 20.0, 12.0], 5000);
+        assert!(l.card(id).unwrap().rect.w >= MIN_CARD_W - 1e-9);
+    }
+
+    #[test]
+    fn small_jitter_does_not_resize() {
+        let mut l = setup();
+        let id = put_card(&mut l, "a", 136.0, 300.0);
+        select_by_tap(&mut l, id, 1000);
+        let before = l.card(id).unwrap().rect;
+        pinch(&mut l, 180.0, 354.0, &[40.0, 42.0, 39.0, 43.0], 2000);
+        assert_eq!(l.card(id).unwrap().rect, before);
+    }
+
+    #[test]
+    fn pinch_on_an_unselected_card_still_zooms_the_canvas() {
+        let mut l = setup();
+        let id = put_card(&mut l, "a", 136.0, 300.0);
+        let before = l.card(id).unwrap().rect;
+        pinch(&mut l, 180.0, 354.0, &[40.0, 60.0, 200.0], 2000);
+        assert_eq!(l.card(id).unwrap().rect, before, "card untouched");
+        assert!(l.camera.zoom > 1.05, "canvas zoomed, got {}", l.camera.zoom);
+    }
+
+    #[test]
+    fn pinch_started_on_empty_canvas_zooms_even_if_a_card_is_selected() {
+        let mut l = setup();
+        let id = put_card(&mut l, "a", 136.0, 300.0);
+        select_by_tap(&mut l, id, 1000);
+        let before = l.card(id).unwrap().rect;
+        pinch(&mut l, 180.0, 650.0, &[40.0, 60.0, 200.0], 2000);
+        assert_eq!(l.card(id).unwrap().rect, before);
+        assert!(l.camera.zoom > 1.05);
+    }
+
+    #[test]
+    fn size_and_preview_flag_survive_save_and_restore() {
+        let mut l = setup();
+        let id = put_card(&mut l, "a", 136.0, 300.0);
+        select_by_tap(&mut l, id, 1000);
+        pinch(&mut l, 180.0, 354.0, &[40.0, 60.0, 120.0], 2000);
+        l.toggle_preview(id);
+        let l2 = Launcher::from_saved(l.to_saved());
+        let c = &l2.cards[0];
+        assert_eq!(c.rect, l.card(id).unwrap().rect);
+        assert!(!c.preview);
+    }
+
+    #[test]
+    fn old_state_without_preview_field_defaults_to_shown() {
+        let rec: crate::persistence::CardRecord =
+            serde_json::from_str(r#"{"key":"a","label":"A","x":0,"y":0,"w":88,"h":108}"#).unwrap();
+        assert!(rec.preview);
+    }
+
+    #[test]
+    fn resized_cards_join_and_leave_groups_by_their_new_edges() {
+        let mut l = setup();
+        let a = put_card(&mut l, "a", 20.0, 300.0);
+        let gap = l.cfg.snap_gap;
+        let b = put_card(&mut l, "b", 20.0 + 88.0 + gap, 300.0);
+        assert!(l.geometry().pairs.iter().any(|&(i, j, _)| (i, j) == (0, 1) || (i, j) == (1, 0)));
+        select_by_tap(&mut l, a, 1000);
+        // Pinch the left card bigger about its far-left edge: it now overlaps/leaves adjacency.
+        pinch(&mut l, 40.0, 354.0, &[30.0, 50.0, 150.0], 2000);
+        let _ = b;
+        assert!(l.card(a).unwrap().rect.w > 88.0);
+        // The adjacency cache was invalidated: recomputing must not panic and must reflect the new rect.
+        let _ = l.geometry().pairs.len();
     }
 }

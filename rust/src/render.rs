@@ -21,6 +21,7 @@ pub const CARD_DRAGGING: u32 = 2;
 pub const CARD_UNAVAILABLE: u32 = 4;
 pub const CARD_SNAP_X: u32 = 8;
 pub const CARD_SNAP_Y: u32 = 16;
+pub const CARD_NO_PREVIEW: u32 = 32;
 
 pub const UI_PRESSED: u32 = 1;
 pub const UI_FILLED: u32 = 2;
@@ -44,6 +45,8 @@ fn ui_code(id: UiId) -> (f32, f32) {
         UiId::ToolGroup => (5.0, 0.0),
         UiId::ToolPin => (6.0, 0.0),
         UiId::ToolRemove => (7.0, 0.0),
+        UiId::ToolPreview => (8.0, 0.0),
+        UiId::CardPreview => (9.0, 0.0),
     }
 }
 
@@ -134,6 +137,9 @@ impl Launcher {
             if !c.available {
                 flags |= CARD_UNAVAILABLE;
             }
+            if !c.preview {
+                flags |= CARD_NO_PREVIEW;
+            }
             let grouped = sizes[groups[i]] > 1;
             card_data.extend_from_slice(&[
                 i as f32,
@@ -166,6 +172,11 @@ impl Launcher {
             if pressed == Some(item.id) {
                 flags |= UI_PRESSED;
             }
+            if item.id == UiId::ToolPreview
+                && self.selected.and_then(|id| self.card(id)).is_some_and(|c| c.preview)
+            {
+                flags |= UI_FILLED; // preview currently shown
+            }
             if let UiId::DockSlot(i) = item.id {
                 if self.dock.get(i as usize).is_some() {
                     flags |= UI_FILLED;
@@ -182,7 +193,13 @@ impl Launcher {
             let r = item.rect;
             ui_data.extend_from_slice(&[kind, slot, r.x as f32, r.y as f32, r.w as f32, r.h as f32, flags as f32]);
         }
-        let n_ui = layout.items.len();
+        if let Some((id, r)) = self.card_button() {
+            let (kind, slot) = ui_code(UiId::CardPreview);
+            let on = self.card(id).is_some_and(|c| c.preview);
+            let flags = if on { UI_FILLED } else { 0 };
+            ui_data.extend_from_slice(&[kind, slot, r.x as f32, r.y as f32, r.w as f32, r.h as f32, flags as f32]);
+        }
+        let n_ui = ui_data.len() / UI_STRIDE;
 
         let pill = layout.dock_pill;
         let (dd_from, dd_over, dd_x) = dock_drag.map_or((-1.0, -1.0, 0.0), |(f, o, x)| (f as f32, o as f32, x as f32));
@@ -239,7 +256,7 @@ mod tests {
         l.render(&mut b);
         let (c, k, u) = count(&b);
         assert_eq!(b.len(), HEADER + c * CARD_STRIDE + k * LINK_STRIDE + u * UI_STRIDE);
-        assert_eq!(u, 5 + 3 + 4, "five slots, drawer, overview, recent + 4 toolbar buttons (a card is selected)");
+        assert_eq!(u, 5 + 3 + 5 + 1, "five slots, drawer, overview, recent + 5 toolbar buttons + the card's round button");
         l.select(None);
         l.render(&mut b);
         let (c, k, u) = count(&b);
