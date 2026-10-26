@@ -12,22 +12,48 @@ The goal of this project is to bring the original project's features and design 
 
 - Android-compatible implementation
 - Adapted from the original DriftWM project
-- Bug fixes and stability improvements
-- Built and tested on a real Android device
+- Tested on multiple real Android devices
 
-## Installation
+## Requirements
+
+- Android 16 or later
+
+## Installation and Setup
+
+### Step 1: Install DriftWM and set it as the default launcher
 
 1. Download the latest APK from the [Releases](../../releases/latest) page
 2. Open the downloaded APK on your Android device
 3. Allow installation from this source if Android asks for permission
 4. Follow the on-screen instructions to install the application
+5. Open your phone's **Settings** and find **Default apps** (the exact name may vary by device)
+6. Open the **Home app** or **Default launcher** setting and select **Drift**
 
-## Requirements
-1. Android 16 or later
+If you cannot find the setting, use the search bar in your phone's Settings and search for **Default apps** or **Home app**
+
+### Step 2: Enable Drift Preview for thumbnails
+
+1. Open your phone's **Settings**
+2. Find **Accessibility**
+3. Open the list of accessibility services and enable **Drift Preview**
+
+The exact menu names may vary depending on your device
+
+**Note:** Drift Preview is only required for thumbnails. Enable it if you want to use the thumbnail feature; it is not required for the launcher itself
 
 ## Download
 
 Get the latest version from [GitHub Releases](../../releases/latest)
+
+## Device Testing
+
+DriftWM for Android has been tested on multiple real Android devices. Compatibility and functionality may still vary depending on the Android version and device
+
+## Security Notice
+
+Drift is intended to be safe to use. However, your device's built-in security scanner or antivirus may occasionally display a warning during installation. This may be a false positive
+
+Only install the APK downloaded from this project's official [GitHub Releases](../../releases/latest) page. If a security warning appears, verify that the APK came from the official release before deciding how to proceed
 
 ## Original Project
 
