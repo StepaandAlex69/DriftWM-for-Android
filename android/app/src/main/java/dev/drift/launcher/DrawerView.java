@@ -89,7 +89,10 @@ final class DrawerView extends LinearLayout {
         listView = new ListView(context);
         listView.setDivider(null);
         listView.setAdapter(adapter);
-        listView.setFastScrollEnabled(true);
+        // No scroll indicators at all: the list must look identical on every screen width.
+        listView.setFastScrollEnabled(false);
+        listView.setVerticalScrollBarEnabled(false);
+        listView.setHorizontalScrollBarEnabled(false);
         listView.setOverScrollMode(OVER_SCROLL_NEVER);
         listView.setOnItemClickListener((parent, v, pos, id) -> {
             if (callback != null && pos >= 0 && pos < keys.length) {
