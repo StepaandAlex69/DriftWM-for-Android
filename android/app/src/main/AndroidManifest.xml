@@ -11,6 +11,15 @@
             <action android:name="android.intent.action.MAIN" />
             <category android:name="android.intent.category.LAUNCHER" />
         </intent>
+        <!-- Read-only, for the diagnostics screen: which apps can be home, and which
+             package serves the system gesture/recents service. -->
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.HOME" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.QUICKSTEP_SERVICE" />
+        </intent>
     </queries>
 
     <application
@@ -34,6 +43,17 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.HOME" />
                 <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <!-- Read-only report about system navigation on this firmware; opened from Drift's app list. -->
+        <activity
+            android:name=".DiagnosticsActivity"
+            android:exported="true"
+            android:label="Drift diagnostics">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
 

@@ -106,7 +106,9 @@ final class AppRepo {
                     long serial = userManager.getSerialNumberForUser(user);
                     for (LauncherActivityInfo info : launcherApps.getActivityList(null, user)) {
                         ComponentName cn = info.getComponentName();
-                        if (cn.getPackageName().equals(ctx.getPackageName())) continue;
+                        // Hide the launcher itself, but keep its diagnostics screen reachable from Drift.
+                        if (cn.getPackageName().equals(ctx.getPackageName())
+                            && !cn.getClassName().equals(DiagnosticsActivity.class.getName())) continue;
                         String key = cn.flattenToString() + (mine ? "" : "#" + serial);
                         String label = String.valueOf(info.getLabel());
                         if (!mine) {
@@ -124,7 +126,10 @@ final class AppRepo {
             String[] k = keys.toArray(new String[0]);
             String[] l = labels.toArray(new String[0]);
             java.util.Set<String> pkgs = new java.util.HashSet<>();
-            for (Entry en : map.values()) pkgs.add(en.component.getPackageName());
+            for (Entry en : map.values()) {
+                // Our own screens are never preview targets.
+                if (!en.component.getPackageName().equals(ctx.getPackageName())) pkgs.add(en.component.getPackageName());
+            }
             main.post(() -> {
                 entries = map;
                 ThumbStore.setKnownPackages(pkgs);
