@@ -54,6 +54,10 @@ public final class LauncherActivity extends Activity implements CanvasView.Host,
 
     private boolean ready;
 
+    private Appearance appearance = Appearance.defaults();
+    private long appearanceRev = -1;
+    private int appearanceGen;
+
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
         installCrashRecorder();
@@ -127,7 +131,7 @@ public final class LauncherActivity extends Activity implements CanvasView.Host,
             return WindowInsets.CONSUMED;
         });
         setContentView(root);
-        applyBarAppearance();
+        refreshAppearance();
 
         if (Build.VERSION.SDK_INT >= 33) {
             backCallback = this::handleBack;
@@ -141,6 +145,7 @@ public final class LauncherActivity extends Activity implements CanvasView.Host,
         super.onResume();
         if (!ready) return;
         Native.resetClock();
+        refreshAppearance(); // may have changed in Drift settings
         repo.scheduleRefresh();
         canvas.invalidate();
     }
@@ -233,15 +238,54 @@ public final class LauncherActivity extends Activity implements CanvasView.Host,
         }
     }
 
-    /** Must run after setContentView: before that the window has no decor view (NPE on some Samsung builds). */
-    private void applyBarAppearance() {
+    /** Reloads colours and the background picture when Drift settings changed them. */
+    private void refreshAppearance() {
+        final long rev = Appearance.rev(this);
+        if (rev == appearanceRev) return;
+        appearanceRev = rev;
+        final int gen = ++appearanceGen; // any load still running for an older state is dropped
+        Appearance quick = Appearance.read(this);
+        // With a picture on screen, keep it until the new one is decoded instead of flashing plain colours.
+        if (quick.source != Appearance.SOURCE_IMAGE || appearance.bitmap == null) applyAppearance(quick);
+        if (quick.source != Appearance.SOURCE_IMAGE) return;
+        final android.content.Context app = getApplicationContext();
+        new Thread(() -> {
+            Appearance full = Appearance.readWithBitmap(app);
+            runOnUiThread(() -> {
+                if (!isDestroyed() && gen == appearanceGen) applyAppearance(full);
+            });
+        }, "drift-appearance").start();
+    }
+
+    private void applyAppearance(Appearance a) {
+        appearance = a;
+        canvas.setAppearance(a);
+        drawer.setAppearance(a);
+        updateBars();
+    }
+
+    /**
+     * System-bar icons must stay readable: dark icons over a light background, light icons over a
+     * dark one. While the app list is open it is the list's colour that sits behind the bars.
+     * Must run after setContentView: before that the window has no decor view (NPE on some Samsung builds).
+     */
+    private void updateBars() {
         try {
             WindowInsetsController ic = getWindow().getInsetsController();
-            if (ic != null) {
-                ic.setSystemBarsAppearance(0,
-                    WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS
-                        | WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS);
+            if (ic == null) return;
+            boolean lightStatus;
+            boolean lightNav;
+            if (drawer != null && drawer.isShowing()) {
+                lightStatus = appearance.pal.light;
+                lightNav = lightStatus;
+            } else {
+                lightStatus = appearance.barLum > 0.6f;
+                lightNav = (appearance.bitmap != null ? Appearance.lum(appearance.avg) : appearance.barLum) > 0.6f;
             }
+            ic.setSystemBarsAppearance(lightStatus ? WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS : 0,
+                WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS);
+            ic.setSystemBarsAppearance(lightNav ? WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS : 0,
+                WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS);
         } catch (RuntimeException ignored) {
             // cosmetic only
         }
@@ -283,6 +327,7 @@ public final class LauncherActivity extends Activity implements CanvasView.Host,
 
     private void showDrawer(int slot) {
         drawer.show(slot);
+        updateBars();
     }
 
     private void showDockMenu(int slot) {
@@ -311,7 +356,13 @@ public final class LauncherActivity extends Activity implements CanvasView.Host,
 
     @Override public void onClose() {
         Native.drawerClosed();
+        updateBars();
         canvas.invalidate();
+    }
+
+    @Override public void onSettings() {
+        drawer.hide();
+        startActivity(new Intent(this, SettingsActivity.class));
     }
 
     // ---- crash report: a home app that dies silently leaves the user with no launcher ----

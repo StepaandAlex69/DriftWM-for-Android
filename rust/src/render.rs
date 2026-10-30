@@ -5,13 +5,15 @@
 //! culled here so a large canvas costs nothing to draw.
 //!
 //! Layout (see `HEADER` for the leading fields):
-//!   header, then `n_cards * CARD_STRIDE`, `n_links * LINK_STRIDE`, `n_ui * UI_STRIDE`.
+//!   header (fields 17..21 are the canvas origin on screen, each coordinate split into
+//!   an f32 high part and an f32 remainder so a background tiled on the canvas stays
+//!   exact far from the origin), then `n_cards * CARD_STRIDE`, `n_links * LINK_STRIDE`, `n_ui * UI_STRIDE`.
 
 use crate::launcher::Launcher;
 use crate::ui::UiId;
 use crate::workspace::{Rect, Vec2};
 
-pub const HEADER: usize = 17;
+pub const HEADER: usize = 21;
 pub const CARD_STRIDE: usize = 7;
 pub const LINK_STRIDE: usize = 4;
 pub const UI_STRIDE: usize = 7;
@@ -89,6 +91,12 @@ impl Launcher {
         let origin = cam.canvas_to_screen(Vec2::ZERO);
         let ox = origin.x.rem_euclid(spacing);
         let oy = origin.y.rem_euclid(spacing);
+        let split = |v: f64| {
+            let hi = v as f32;
+            (hi, (v - f64::from(hi)) as f32)
+        };
+        let (origin_x_hi, origin_x_lo) = split(origin.x);
+        let (origin_y_hi, origin_y_lo) = split(origin.y);
         let dot_r = (1.1 + 0.9 * zoom.clamp(0.0, 1.5)).min(2.4);
 
         let layout = self.ui_layout();
@@ -221,6 +229,10 @@ impl Launcher {
             dd_over,
             dd_x,
             self.selected.is_some() as u8 as f32,
+            origin_x_hi,
+            origin_x_lo,
+            origin_y_hi,
+            origin_y_lo,
         ]);
         debug_assert_eq!(out.len(), HEADER);
         out.extend_from_slice(&card_data);
@@ -262,6 +274,21 @@ mod tests {
         let (c, k, u) = count(&b);
         assert_eq!(u, 5 + 3, "no toolbar without a selection");
         assert_eq!(b.len(), HEADER + c * CARD_STRIDE + k * LINK_STRIDE + u * UI_STRIDE);
+    }
+
+    #[test]
+    fn origin_is_exact_even_far_from_the_canvas_origin() {
+        let mut l = launcher();
+        l.camera.zoom = 0.75;
+        l.camera.pos = Vec2::new(-1_234_567.891_234_5, 7_654_321.123_456_7);
+        let want = l.camera.canvas_to_screen(Vec2::ZERO);
+        let mut b = Vec::new();
+        l.render(&mut b);
+        let x = f64::from(b[17]) + f64::from(b[18]);
+        let y = f64::from(b[19]) + f64::from(b[20]);
+        assert!((x - want.x).abs() < 1e-4 && (y - want.y).abs() < 1e-4, "{x} {y} vs {want:?}");
+        // a plain f32 would be off by far more than that at this distance
+        assert!((f64::from(b[17]) - want.x).abs() > 1e-4);
     }
 
     #[test]

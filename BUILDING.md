@@ -31,3 +31,19 @@ Emulator: `./gradlew assembleDebug -PdriftAbis=arm64-v8a,x86_64`
 ## Debugging on the device
 
     adb logcat | grep -iE "drift|AndroidRuntime|UnsatisfiedLink"
+
+## Checking system navigation with Drift as home
+
+In-app: open "Drift diagnostics" from Drift's app list (search "diagnostics"), tap Copy/Share.
+
+Same facts over adb (nothing is changed):
+
+    adb shell cmd role get-role-holders android.app.role.HOME
+    adb shell cmd overlay lookup android android:string/config_recentsComponentName
+    adb shell dumpsys activity service SystemUIService | grep -i -E "recents|quickstep|overview"
+    adb shell cmd package query-services -a android.intent.action.QUICKSTEP_SERVICE
+    adb shell settings get secure navigation_mode
+    adb logcat -b all | grep -i -E "quickstep|recents|OverviewProxy|gesture"   # while swiping on the bad device
+
+A/B on the affected device: (1) Drift as home, previews service off -> test recents and the bottom swipe;
+(2) previews service on -> repeat; (3) stock launcher -> repeat. Send the diagnostics report plus the logcat.

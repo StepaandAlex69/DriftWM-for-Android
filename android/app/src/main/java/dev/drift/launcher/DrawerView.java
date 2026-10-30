@@ -30,6 +30,9 @@ final class DrawerView extends LinearLayout {
         void onPick(String key);
 
         void onClose();
+
+        /** The "Drift settings" row was tapped. */
+        void onSettings();
     }
 
     private final float density;
@@ -37,6 +40,9 @@ final class DrawerView extends LinearLayout {
     private final IconCache icons;
     private final TextView title;
     private final EditText search;
+    private final TextView settingsRow;
+    private Appearance.Palette pal = Appearance.defaults().pal;
+    private int slotMode = -1;
     private final ListView listView;
     private final Adapter adapter = new Adapter();
     private Callback callback;
@@ -48,13 +54,11 @@ final class DrawerView extends LinearLayout {
         this.icons = icons;
         density = context.getResources().getDisplayMetrics().density;
         setOrientation(VERTICAL);
-        setBackgroundColor(0xF2101216);
         setVisibility(GONE);
         setClickable(true); // swallow touches so the canvas below never sees them
 
         int p = dp(16);
         title = new TextView(context);
-        title.setTextColor(0xFF7AA2FF);
         title.setTextSize(14);
         title.setTypeface(Typeface.DEFAULT_BOLD);
         title.setPadding(p, dp(12), p, 0);
@@ -63,13 +67,10 @@ final class DrawerView extends LinearLayout {
 
         search = new EditText(context);
         search.setHint("Search apps");
-        search.setHintTextColor(0xFF6B7280);
-        search.setTextColor(0xFFE6E8EC);
         search.setTextSize(16);
         search.setSingleLine(true);
         search.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
         search.setImeOptions(EditorInfo.IME_ACTION_SEARCH);
-        search.setBackgroundColor(0xFF1B1E24);
         search.setPadding(p, dp(12), p, dp(12));
         search.setOnEditorActionListener((v, action, ev) -> {
             hideKeyboard();
@@ -85,6 +86,23 @@ final class DrawerView extends LinearLayout {
         LayoutParams sp = new LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         sp.setMargins(p, dp(8), p, dp(8));
         addView(search, sp);
+
+        // Entry to Drift's own settings; shown in the normal list (and when the search matches it).
+        settingsRow = new TextView(context);
+        settingsRow.setText("Drift settings  \u203A");
+        settingsRow.setTextSize(16);
+        settingsRow.setTypeface(Typeface.DEFAULT_BOLD);
+        settingsRow.setGravity(Gravity.CENTER_VERTICAL);
+        settingsRow.setSingleLine(true);
+        settingsRow.setPadding(p, dp(10), p, dp(10));
+        settingsRow.setOnClickListener(v -> {
+            if (callback != null) {
+                hideKeyboard();
+                callback.onSettings();
+            }
+        });
+        addView(settingsRow, new LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        applyPalette();
 
         listView = new ListView(context);
         listView.setDivider(null);
@@ -103,6 +121,21 @@ final class DrawerView extends LinearLayout {
         addView(listView, new LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
     }
 
+    void setAppearance(Appearance a) {
+        pal = a.pal;
+        applyPalette();
+        adapter.notifyDataSetChanged();
+    }
+
+    private void applyPalette() {
+        setBackgroundColor(pal.drawerBg);
+        title.setTextColor(pal.accent);
+        search.setHintTextColor(pal.hint);
+        search.setTextColor(pal.text);
+        search.setBackgroundColor(pal.searchBg);
+        settingsRow.setTextColor(pal.accent);
+    }
+
     void setCallback(Callback c) {
         callback = c;
     }
@@ -117,6 +150,7 @@ final class DrawerView extends LinearLayout {
 
     /** @param slot dock slot being chosen (0-based), or -1 for the normal list */
     void show(int slot) {
+        slotMode = slot;
         if (slot >= 0) {
             title.setText("Choose an app for dock slot " + (slot + 1));
             title.setVisibility(VISIBLE);
@@ -152,6 +186,9 @@ final class DrawerView extends LinearLayout {
     private void reload() {
         String[] found = Native.searchApps(search.getText().toString());
         keys = found == null ? new String[0] : found;
+        String q = search.getText().toString().trim().toLowerCase(java.util.Locale.ROOT);
+        boolean matches = q.isEmpty() || "drift settings".contains(q);
+        settingsRow.setVisibility(slotMode < 0 && matches ? VISIBLE : GONE);
         adapter.notifyDataSetChanged();
     }
 
@@ -187,6 +224,7 @@ final class DrawerView extends LinearLayout {
             }
             String key = keys[i];
             row.name.setText(repo.label(key));
+            row.name.setTextColor(pal.text);
             Bitmap icon = icons.get(key);
             if (icon != null) {
                 row.icon.setImageBitmap(icon);
@@ -209,7 +247,6 @@ final class DrawerView extends LinearLayout {
             icon = new ImageView(context);
             addView(icon, new LayoutParams(dp(44), dp(44)));
             name = new TextView(context);
-            name.setTextColor(0xFFE6E8EC);
             name.setTextSize(16);
             name.setSingleLine(true);
             name.setEllipsize(android.text.TextUtils.TruncateAt.END);

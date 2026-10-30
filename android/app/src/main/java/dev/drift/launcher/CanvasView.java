@@ -2,11 +2,14 @@ package dev.drift.launcher;
 
 import android.content.Context;
 import android.graphics.Bitmap;
+import android.graphics.BitmapShader;
 import android.graphics.Canvas;
+import android.graphics.Matrix;
 import android.graphics.DashPathEffect;
 import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.RectF;
+import android.graphics.Shader;
 import android.os.SystemClock;
 import android.view.MotionEvent;
 import android.view.View;
@@ -21,7 +24,7 @@ import java.util.List;
  * reach this class (the core culls them). Everything is drawn in dp.
  *
  * Display list layout (must match rust/src/render.rs):
- *   header[17], cards[n * 7], links[n * 4], ui[n * 7]
+ *   header[21], cards[n * 7], links[n * 4], ui[n * 7]
  */
 final class CanvasView extends View {
     interface Host {
@@ -29,7 +32,7 @@ final class CanvasView extends View {
         void onCoreEvents(List<String> events);
     }
 
-    private static final int HEADER = 17;
+    private static final int HEADER = 21;
     private static final int CARD_STRIDE = 7;
     private static final int LINK_STRIDE = 4;
     private static final int UI_STRIDE = 7;
@@ -45,16 +48,7 @@ final class CanvasView extends View {
     private static final int UI_DRAG_OVER = 4;
     private static final int UI_DRAG_SOURCE = 8;
 
-    private static final int BG = 0xFF101216;
-    private static final int DOT = 0xFF343944;
-    private static final int CARD = 0xFF22262E;
-    private static final int CARD_DRAG = 0xFF2B303A;
-    private static final int STROKE = 0xFF363C48;
-    private static final int ACCENT = 0xFF7AA2FF;
     private static final int SNAP = 0xFF5ED6A0;
-    private static final int TEXT = 0xFFE6E8EC;
-    private static final int TEXT_DIM = 0xFF8A91A0;
-    private static final int PILL = 0xF01A1D23;
     private static final int[] GROUP = {
         0xFFE5766B, 0xFFE8B05C, 0xFF8FCB6A, 0xFF5DBFB4, 0xFF6C9BE8, 0xFFB58CE0
     };
@@ -62,6 +56,12 @@ final class CanvasView extends View {
     private static final String[] TOOL_LABEL = {"Center", "Group", "Pin", "Remove", "Preview"};
 
     private final float density;
+    private Appearance ap = Appearance.defaults();
+    private Appearance.Palette pal = ap.pal;
+    private BitmapShader tileShader;
+    private final Matrix tileMatrix = new Matrix();
+    private final Paint tilePaint = new Paint(Paint.FILTER_BITMAP_FLAG);
+    private final Paint bgPaint = new Paint(Paint.FILTER_BITMAP_FLAG);
     private final IconCache icons;
     private final ThumbCache thumbs;
     private Host host;
@@ -101,17 +101,35 @@ final class CanvasView extends View {
 
         dotPaint.setStyle(Paint.Style.STROKE);
         dotPaint.setStrokeCap(Paint.Cap.ROUND);
-        dotPaint.setColor(DOT);
         stroke.setStyle(Paint.Style.STROKE);
         stroke.setStrokeCap(Paint.Cap.ROUND);
-        cardPaint.setColor(CARD);
         cardPaint.setShadowLayer(8f * density, 0f, 3f * density, 0x66000000);
-        cardDragPaint.setColor(CARD_DRAG);
         cardDragPaint.setShadowLayer(18f * density, 0f, 8f * density, 0x99000000);
         centered.setTextAlign(Paint.Align.CENTER);
-        centered.setColor(TEXT);
         left.setTextAlign(Paint.Align.LEFT);
-        left.setColor(TEXT);
+        applyAppearance();
+    }
+
+    void setAppearance(Appearance a) {
+        ap = a;
+        pal = a.pal;
+        tileShader = null;
+        if (a.source == Appearance.SOURCE_IMAGE && a.bitmap != null && a.imageMode == Appearance.IMAGE_INFINITE) {
+            tileShader = new BitmapShader(a.bitmap, Shader.TileMode.REPEAT, Shader.TileMode.REPEAT);
+            tilePaint.setShader(tileShader);
+        } else {
+            tilePaint.setShader(null);
+        }
+        applyAppearance();
+        invalidate();
+    }
+
+    private void applyAppearance() {
+        dotPaint.setColor(ap.dot);
+        cardPaint.setColor(pal.card);
+        cardDragPaint.setColor(pal.cardDrag);
+        centered.setColor(pal.text);
+        left.setColor(pal.text);
     }
 
     void setHost(Host h) {
@@ -180,10 +198,11 @@ final class CanvasView extends View {
             list = new float[n + 2048];
             n = Native.render(list);
         }
-        c.drawColor(BG);
         if (n < HEADER) {
+            c.drawColor(ap.bg);
             return;
         }
+        drawBackground(c);
         int version = (int) list[0];
         if (version != tableVersion) {
             refreshTable();
@@ -193,7 +212,7 @@ final class CanvasView extends View {
         float d = density;
         c.save();
         c.scale(d, d);
-        drawDots(c);
+        if (ap.source != Appearance.SOURCE_IMAGE) drawDots(c); // a picture replaces colours and dots
         int nCards = (int) list[6];
         int nLinks = (int) list[7];
         int nUi = (int) list[8];
@@ -249,6 +268,59 @@ final class CanvasView extends View {
         }
     }
 
+    /** Plain colour, a picture fixed to the screen, or a picture tiled on the canvas. */
+    private void drawBackground(Canvas c) {
+        Bitmap bmp = ap.source == Appearance.SOURCE_IMAGE ? ap.bitmap : null;
+        if (bmp == null) {
+            c.drawColor(ap.bg);
+        } else if (ap.imageMode == Appearance.IMAGE_INFINITE && tileShader != null) {
+            drawTiled(c, bmp);
+        } else {
+            drawStatic(c, bmp);
+        }
+    }
+
+    /** Fixed to the screen like ordinary wallpaper: center-cropped, ignores the camera. */
+    private void drawStatic(Canvas c, Bitmap bmp) {
+        float vw = getWidth();
+        float vh = getHeight();
+        float bw = bmp.getWidth();
+        float bh = bmp.getHeight();
+        float k = Math.max(vw / bw, vh / bh);
+        float sw = vw / k;
+        float sh = vh / k;
+        int sx = Math.round((bw - sw) / 2f);
+        int sy = Math.round((bh - sh) / 2f);
+        srcRect.set(Math.max(0, sx), Math.max(0, sy),
+            Math.min(bmp.getWidth(), Math.round(sx + sw)), Math.min(bmp.getHeight(), Math.round(sy + sh)));
+        r2.set(0f, 0f, vw, vh);
+        c.drawBitmap(bmp, srcRect, r2, bgPaint);
+    }
+
+    /**
+     * Pinned to the canvas: one bitmap pixel is one screen pixel at zoom 1, the grid starts at the
+     * canvas origin like the dots do, so panning moves it with the cards and zooming scales it.
+     * The origin arrives as high + low floats and is reduced modulo the tile in double precision,
+     * so the picture does not jitter far from the origin.
+     */
+    private void drawTiled(Canvas c, Bitmap bmp) {
+        float zoom = list[1];
+        double pitchX = bmp.getWidth() * (double) zoom;
+        double pitchY = bmp.getHeight() * (double) zoom;
+        if (pitchX < 2.0 || pitchY < 2.0) { // tiles smaller than a couple of pixels: show their mean colour
+            c.drawColor(ap.avg);
+            return;
+        }
+        double ox = ((double) list[17] + list[18]) * density;
+        double oy = ((double) list[19] + list[20]) * density;
+        double tx = ox % pitchX;
+        double ty = oy % pitchY;
+        tileMatrix.setScale(zoom, zoom);
+        tileMatrix.postTranslate((float) tx, (float) ty);
+        tileShader.setLocalMatrix(tileMatrix);
+        c.drawRect(0f, 0f, getWidth(), getHeight(), tilePaint);
+    }
+
     private void drawDots(Canvas c) {
         float spacing = list[2];
         if (spacing < 1f) return;
@@ -274,7 +346,7 @@ final class CanvasView extends View {
     }
 
     private void drawLinks(Canvas c, int base, int n) {
-        stroke.setColor((ACCENT & 0x00FFFFFF) | 0x66000000);
+        stroke.setColor((pal.accent & 0x00FFFFFF) | 0x66000000);
         stroke.setStrokeWidth(2.5f);
         for (int i = 0; i < n; i++) {
             int b = base + i * LINK_STRIDE;
@@ -298,7 +370,7 @@ final class CanvasView extends View {
         r.set(x, y, x + w, y + h);
         c.drawRoundRect(r, rad, rad, dragging ? cardDragPaint : cardPaint);
 
-        int border = STROKE;
+        int border = pal.stroke;
         float bw = 1f;
         if (group >= 0) {
             border = GROUP[group % GROUP.length];
@@ -309,7 +381,7 @@ final class CanvasView extends View {
             bw = 2.5f;
         }
         if (selected) {
-            border = ACCENT;
+            border = pal.accent;
             bw = 2.5f;
         }
         stroke.setColor(border);
@@ -327,7 +399,7 @@ final class CanvasView extends View {
             // Small icon badge and a label strip keep the app identifiable.
             float badge = Math.min(w * 0.26f, 26f);
             if (icon != null && badge >= 8f) {
-                fill.setColor(0xCC101216);
+                fill.setColor(pal.scrim);
                 c.drawCircle(x + badge * 0.85f, y + badge * 0.85f, badge * 0.78f, fill);
                 bitmapPaint.setAlpha(alpha);
                 r2.set(x + badge * 0.2f, y + badge * 0.2f, x + badge * 1.5f, y + badge * 1.5f);
@@ -337,14 +409,14 @@ final class CanvasView extends View {
             if (ts >= 6.5f) {
                 float strip = ts * 2.1f;
                 r2.set(x, y + h - strip, x + w, y + h);
-                fill.setColor(0xB0101216);
+                fill.setColor(pal.strip);
                 c.save();
                 path.rewind();
                 path.addRoundRect(r, rad, rad, Path.Direction.CW);
                 c.clipPath(path);
                 c.drawRect(r2, fill);
                 c.restore();
-                drawLabel(c, label, x, w, y + h - strip + ts * 1.45f, ts, unavailable ? TEXT_DIM : TEXT);
+                drawLabel(c, label, x, w, y + h - strip + ts * 1.45f, ts, unavailable ? pal.textDim : pal.text);
             }
         } else {
             // No preview captured yet: icon + name, centered.
@@ -358,11 +430,11 @@ final class CanvasView extends View {
                 r2.set(ix, iy, ix + iconSize, iy + iconSize);
                 c.drawBitmap(icon, null, r2, bitmapPaint);
             } else {
-                fill.setColor(0xFF3A404C);
+                fill.setColor(pal.placeholder);
                 c.drawCircle(ix + iconSize / 2f, iy + iconSize / 2f, iconSize / 2f, fill);
             }
             if (ts >= 6.5f) {
-                drawLabel(c, label, x, w, iy + iconSize + ts * 1.45f, ts, unavailable ? TEXT_DIM : TEXT);
+                drawLabel(c, label, x, w, iy + iconSize + ts * 1.45f, ts, unavailable ? pal.textDim : pal.text);
             }
         }
         if (unavailable) {
@@ -370,9 +442,9 @@ final class CanvasView extends View {
             float br = Math.max(5f, w * 0.1f);
             fill.setColor(0xFFE5766B);
             c.drawCircle(x + w - br - 3f, y + br + 3f, br, fill);
-            fill.setColor(0xFF101216);
+            fill.setColor(pal.ink);
             float s = br * 0.45f;
-            stroke.setColor(0xFF101216);
+            stroke.setColor(pal.ink);
             stroke.setStrokeWidth(Math.max(1.2f, br * 0.22f));
             float cx = x + w - br - 3f;
             float cy = y + br + 3f;
@@ -427,9 +499,9 @@ final class CanvasView extends View {
     private void drawUi(Canvas c, int base, int n) {
         float px = list[9], py = list[10], pw = list[11], ph = list[12];
         r.set(px, py, px + pw, py + ph);
-        fill.setColor(PILL);
+        fill.setColor(pal.pill);
         c.drawRoundRect(r, ph * 0.4f, ph * 0.4f, fill);
-        stroke.setColor(STROKE);
+        stroke.setColor(pal.stroke);
         stroke.setStrokeWidth(1f);
         c.drawRoundRect(r, ph * 0.4f, ph * 0.4f, stroke);
 
@@ -488,7 +560,7 @@ final class CanvasView extends View {
         float cx = r.centerX(), cy = r.centerY();
         float s = r.width() * (pressed ? 0.8f : 0.9f);
         if ((flags & UI_DRAG_OVER) != 0) {
-            stroke.setColor(ACCENT);
+            stroke.setColor(pal.accent);
             stroke.setStrokeWidth(2f);
             c.drawRoundRect(r, r.width() * 0.28f, r.width() * 0.28f, stroke);
         }
@@ -500,12 +572,12 @@ final class CanvasView extends View {
                 r2.set(cx - s / 2f, cy - s / 2f, cx + s / 2f, cy + s / 2f);
                 c.drawBitmap(icon, null, r2, bitmapPaint);
             } else {
-                fill.setColor(0xFF3A404C);
+                fill.setColor(pal.placeholder);
                 c.drawCircle(cx, cy, s / 2f, fill);
             }
         } else {
             // Empty slot: dashed outline with a plus; tapping it opens the app list.
-            stroke.setColor(TEXT_DIM);
+            stroke.setColor(pal.textDim);
             stroke.setStrokeWidth(1.3f);
             stroke.setPathEffect(new DashPathEffect(new float[] {4f, 4f}, 0f));
             float inset = r.width() * 0.1f;
@@ -519,10 +591,10 @@ final class CanvasView extends View {
     }
 
     private void drawDrawerButton(Canvas c, boolean pressed) {
-        fill.setColor(pressed ? 0xFF9BB8FF : ACCENT);
+        fill.setColor(pressed ? pal.accentPressed : pal.accent);
         float cx = r.centerX(), cy = r.centerY();
         c.drawCircle(cx, cy, r.width() / 2f, fill);
-        fill.setColor(0xFF101216);
+        fill.setColor(pal.ink);
         float step = r.width() * 0.2f;
         for (int row = -1; row <= 1; row++) {
             for (int col = -1; col <= 1; col++) {
@@ -532,11 +604,11 @@ final class CanvasView extends View {
     }
 
     private void drawNavButton(Canvas c, int kind, boolean pressed) {
-        fill.setColor(pressed ? 0xF0303541 : 0xE01A1D23);
+        fill.setColor(pressed ? pal.pressedFill : pal.nav);
         float cx = r.centerX(), cy = r.centerY();
         float rad = r.width() / 2f;
         c.drawCircle(cx, cy, rad, fill);
-        stroke.setColor(TEXT);
+        stroke.setColor(pal.text);
         stroke.setStrokeWidth(1.8f);
         if (kind == 2) {
             // Overview: four corner brackets.
@@ -558,13 +630,13 @@ final class CanvasView extends View {
     }
 
     private void drawTool(Canvas c, int tool, boolean pressed, boolean on) {
-        fill.setColor(pressed ? 0xF0303541 : 0xF01A1D23);
+        fill.setColor(pressed ? pal.pressedFill : pal.pill);
         float rad = r.height() / 2f;
         c.drawRoundRect(r, rad, rad, fill);
         boolean remove = tool == 3;
         boolean preview = tool == 4;
-        int accent = remove ? 0xFFE5766B : (preview ? (on ? ACCENT : TEXT_DIM) : TEXT);
-        stroke.setColor(remove ? 0xFFE5766B : (preview && on ? ACCENT : STROKE));
+        int accent = remove ? 0xFFE5766B : (preview ? (on ? pal.accent : pal.textDim) : pal.text);
+        stroke.setColor(remove ? 0xFFE5766B : (preview && on ? pal.accent : pal.stroke));
         stroke.setStrokeWidth(1f);
         c.drawRoundRect(r, rad, rad, stroke);
         centered.setTextSize(12f);
@@ -574,19 +646,19 @@ final class CanvasView extends View {
         if (preview && !on) {
             // Preview hidden for this card: strike the label through.
             float half = centered.measureText(TOOL_LABEL[tool]) / 2f;
-            stroke.setColor(TEXT_DIM);
+            stroke.setColor(pal.textDim);
             stroke.setStrokeWidth(1.4f);
             c.drawLine(r.centerX() - half, ty - 3.6f, r.centerX() + half, ty - 3.6f, stroke);
         }
-        centered.setColor(TEXT);
+        centered.setColor(pal.text);
     }
 
     /** Round "eye" button in the selected card's top-right corner: tap to show/hide its preview. */
     private void drawCardButton(Canvas c, boolean on) {
         float cx = r.centerX(), cy = r.centerY(), rad = r.width() / 2f;
-        fill.setColor(0xE6101216);
+        fill.setColor(pal.cardButton);
         c.drawCircle(cx, cy, rad, fill);
-        int color = on ? ACCENT : TEXT_DIM;
+        int color = on ? pal.accent : pal.textDim;
         stroke.setColor(color);
         stroke.setStrokeWidth(1.6f);
         c.drawCircle(cx, cy, rad, stroke);

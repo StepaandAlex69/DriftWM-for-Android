@@ -1,8 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- No permissions on purpose: LauncherApps lists and starts launchable apps
-         without QUERY_ALL_PACKAGES or package-visibility declarations. -->
+    <!-- 4.3-beta EXPERIMENT (Huawei hypothesis), remove if it changes nothing.
+         Stock Android has no "navigation" permission for a home app, so these are the
+         closest declarations that exist; none of them is used by Drift's code.
+         REORDER_TASKS is a normal permission (granted at install); GET_TASKS is
+         ignored by Android 5+ for third-party apps; the com.huawei.* ones are
+         Huawei launcher permissions, unknown (and harmless) on other devices. -->
+    <uses-permission android:name="android.permission.REORDER_TASKS" />
+    <uses-permission android:name="android.permission.GET_TASKS" />
+    <uses-permission android:name="com.huawei.android.launcher.permission.READ_SETTINGS" />
+    <uses-permission android:name="com.huawei.android.launcher.permission.WRITE_SETTINGS" />
 
     <!-- Package visibility (Android 11+): without this only a handful of apps are visible.
          Declares exactly "apps that have a launcher entry"; no QUERY_ALL_PACKAGES. -->
@@ -45,6 +53,12 @@
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </activity>
+
+        <!-- Colours and background picture; opened from the "Drift settings" row of the app list. -->
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="false"
+            android:label="Drift settings" />
 
         <!-- Read-only report about system navigation on this firmware; opened from Drift's app list. -->
         <activity
