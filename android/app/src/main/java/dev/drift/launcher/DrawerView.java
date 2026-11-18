@@ -43,6 +43,7 @@ final class DrawerView extends LinearLayout {
     private final TextView settingsRow;
     private Appearance.Palette pal = Appearance.defaults().pal;
     private int slotMode = -1;
+    private int folderMode = -1;
     private final ListView listView;
     private final Adapter adapter = new Adapter();
     private Callback callback;
@@ -66,7 +67,7 @@ final class DrawerView extends LinearLayout {
         addView(title, new LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         search = new EditText(context);
-        search.setHint("Search apps");
+        search.setHint(context.getString(R.string.search_apps));
         search.setTextSize(16);
         search.setSingleLine(true);
         search.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
@@ -89,7 +90,7 @@ final class DrawerView extends LinearLayout {
 
         // Entry to Drift's own settings; shown in the normal list (and when the search matches it).
         settingsRow = new TextView(context);
-        settingsRow.setText("Drift settings  \u203A");
+        settingsRow.setText(context.getString(R.string.drift_settings) + "  \u203A");
         settingsRow.setTextSize(16);
         settingsRow.setTypeface(Typeface.DEFAULT_BOLD);
         settingsRow.setGravity(Gravity.CENTER_VERTICAL);
@@ -148,15 +149,34 @@ final class DrawerView extends LinearLayout {
         return getVisibility() == VISIBLE;
     }
 
+    /** Folder id the list is choosing an app for, or -1. */
+    int folderMode() {
+        return folderMode;
+    }
+
+    /** Pick an app to add into a dock folder. */
+    void showForFolder(int folderId, String folderName) {
+        folderMode = folderId;
+        slotMode = -1;
+        title.setText(getContext().getString(R.string.drawer_title_folder, folderName));
+        title.setVisibility(VISIBLE);
+        open();
+    }
+
     /** @param slot dock slot being chosen (0-based), or -1 for the normal list */
     void show(int slot) {
         slotMode = slot;
+        folderMode = -1;
         if (slot >= 0) {
-            title.setText("Choose an app for dock slot " + (slot + 1));
+            title.setText(getContext().getString(R.string.drawer_title_slot, slot + 1));
             title.setVisibility(VISIBLE);
         } else {
             title.setVisibility(GONE);
         }
+        open();
+    }
+
+    private void open() {
         search.setText("");
         reload();
         listView.setSelection(0);
@@ -171,6 +191,7 @@ final class DrawerView extends LinearLayout {
         animate().cancel();
         setVisibility(GONE);
         setAlpha(1f);
+        folderMode = -1;
         if (callback != null) callback.onClose();
     }
 
@@ -187,8 +208,9 @@ final class DrawerView extends LinearLayout {
         String[] found = Native.searchApps(search.getText().toString());
         keys = found == null ? new String[0] : found;
         String q = search.getText().toString().trim().toLowerCase(java.util.Locale.ROOT);
-        boolean matches = q.isEmpty() || "drift settings".contains(q);
-        settingsRow.setVisibility(slotMode < 0 && matches ? VISIBLE : GONE);
+        boolean matches = q.isEmpty()
+            || getContext().getString(R.string.drift_settings).toLowerCase(java.util.Locale.getDefault()).contains(q);
+        settingsRow.setVisibility(slotMode < 0 && folderMode < 0 && matches ? VISIBLE : GONE);
         adapter.notifyDataSetChanged();
     }
 

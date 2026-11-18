@@ -113,7 +113,7 @@ final class ColorPickerDialog {
             .setTitle(title)
             .setView(col)
             .setPositiveButton(android.R.string.ok, (dlg, w) -> onPick.accept(0xFF000000 | Color.HSVToColor(hsv)))
-            .setNeutralButton("Default", (dlg, w) -> onPick.accept(defaultColor))
+            .setNeutralButton(R.string.action_default, (dlg, w) -> onPick.accept(defaultColor))
             .setNegativeButton(android.R.string.cancel, null)
             .show();
     }

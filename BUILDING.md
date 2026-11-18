@@ -47,3 +47,19 @@ Same facts over adb (nothing is changed):
 
 A/B on the affected device: (1) Drift as home, previews service off -> test recents and the bottom swipe;
 (2) previews service on -> repeat; (3) stock launcher -> repeat. Send the diagnostics report plus the logcat.
+
+## Strings and languages (V6)
+
+All user-visible text lives in `tools/strings_table.py` as `(key, English, Russian)`.
+After editing it run `python3 tools/gen_strings.py` (writes `res/values/strings.xml` and
+`res/values-ru/strings.xml`), then `python3 tools/check_l10n.py`. The check also runs in CI and fails on:
+a missing translation, different placeholders, Russian text without Cyrillic, a string literal passed to
+`setText/setTitle/Toast.makeText/...` in Java, an undefined `R.string.X`, or a toast code in
+`rust/src/messages.rs` without `msg_<code>` in both languages. The language follows the system and can be
+forced in Drift settings > Interface > Language.
+
+## State format
+
+`workspace.json` is versioned. Version 2 adds dock folders, the dock size and the camera. Version 1 files are
+read and migrated (a copy is kept once as `workspace.json.v1`). Older builds refuse a newer version instead of
+misreading it.

@@ -2,7 +2,6 @@
 //! the selection toolbar. None of these are canvas objects, so they never move
 //! with the camera. All coordinates are dp in screen space.
 
-use crate::dock::SLOTS;
 use crate::workspace::{Rect, Vec2};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,7 +54,7 @@ pub struct UiItem {
 #[derive(Debug, Clone)]
 pub struct UiLayout {
     pub items: Vec<UiItem>,
-    /// Background pill behind the five dock slots.
+    /// Background pill behind the dock slots.
     pub dock_pill: Rect,
 }
 
@@ -66,25 +65,28 @@ const ROW_GAP: f64 = 10.0;
 const PILL_PAD: f64 = 6.0;
 const SLOT_GAP: f64 = 4.0;
 const MAX_SLOT: f64 = 60.0;
+const MIN_SLOT: f64 = 14.0;
 const NAV_BTN: f64 = 40.0;
 const TOOL_W: f64 = 64.0;
 const TOOL_H: f64 = 40.0;
 const TOOL_GAP: f64 = 8.0;
 
-pub fn layout(viewport: Vec2, insets: Insets, has_selection: bool) -> UiLayout {
+pub fn layout(viewport: Vec2, insets: Insets, has_selection: bool, slots: usize) -> UiLayout {
+    let slots = slots.clamp(crate::dock::MIN_SLOTS, crate::dock::MAX_SLOTS);
     let left = insets.left + MARGIN;
     let right = viewport.x - insets.right - MARGIN;
     let bottom = viewport.y - insets.bottom - BOTTOM_PAD;
 
     let pill_avail = (right - left) - ROW_GAP - DRAWER_BTN;
-    let slot = ((pill_avail - 2.0 * PILL_PAD - SLOT_GAP * (SLOTS as f64 - 1.0)) / SLOTS as f64)
-        .clamp(24.0, MAX_SLOT);
-    let pill_w = slot * SLOTS as f64 + SLOT_GAP * (SLOTS as f64 - 1.0) + 2.0 * PILL_PAD;
+    // Slots shrink to fit (down to MIN_SLOT_PX); the pill never reaches the all-apps button.
+    let slot = ((pill_avail - 2.0 * PILL_PAD - SLOT_GAP * (slots as f64 - 1.0)) / slots as f64)
+        .clamp(MIN_SLOT, MAX_SLOT);
+    let pill_w = slot * slots as f64 + SLOT_GAP * (slots as f64 - 1.0) + 2.0 * PILL_PAD;
     let pill_h = slot + 2.0 * PILL_PAD;
     let pill = Rect::new(left, bottom - pill_h, pill_w, pill_h);
 
     let mut items = Vec::new();
-    for i in 0..SLOTS {
+    for i in 0..slots {
         items.push(UiItem {
             id: UiId::DockSlot(i as u8),
             rect: Rect::new(
@@ -176,6 +178,10 @@ mod tests {
     use super::*;
 
     fn lay(w: f64, h: f64, sel: bool) -> UiLayout {
+        lay_n(w, h, sel, 5)
+    }
+
+    fn lay_n(w: f64, h: f64, sel: bool, n: usize) -> UiLayout {
         layout(
             Vec2::new(w, h),
             Insets {
@@ -185,6 +191,7 @@ mod tests {
                 bottom: 24.0,
             },
             sel,
+            n,
         )
     }
 
@@ -247,9 +254,45 @@ mod tests {
                 bottom: 0.0,
             },
             false,
+            5,
         );
         let first = l.rect_of(UiId::DockSlot(0)).unwrap();
         assert!(first.x >= 48.0);
         assert!(l.rect_of(UiId::Drawer).unwrap().x_high() <= 800.0 - 48.0);
+    }
+
+    #[test]
+    fn every_slot_count_fits_beside_the_drawer_button_on_any_width() {
+        for n in 3..=8usize {
+            for w in [240.0, 280.0, 320.0, 360.0, 412.0, 600.0, 800.0, 1280.0] {
+                let l = lay_n(w, 800.0, false, n);
+                let slots: Vec<_> = l
+                    .items
+                    .iter()
+                    .filter(|i| matches!(i.id, UiId::DockSlot(_)))
+                    .collect();
+                assert_eq!(slots.len(), n);
+                let drawer = l.rect_of(UiId::Drawer).unwrap();
+                let last = slots.last().unwrap().rect;
+                assert!(l.dock_pill.x_high() <= drawer.x + 1e-9, "pill reaches the drawer button: n={n} w={w}");
+                assert!(last.x_high() <= l.dock_pill.x_high() + 1e-9);
+                assert!(slots[0].rect.x >= l.dock_pill.x);
+                assert!(l.dock_pill.x >= 0.0);
+                for pair in slots.windows(2) {
+                    assert!(!pair[0].rect.intersects(&pair[1].rect));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn more_slots_never_enlarge_the_slots() {
+        let mut prev = f64::MAX;
+        for n in 3..=8usize {
+            let s = lay_n(360.0, 800.0, false, n).rect_of(UiId::DockSlot(0)).unwrap().w;
+            assert!(s <= prev + 1e-9);
+            prev = s;
+        }
+        assert!(prev >= 24.0, "8 slots on a 360 dp phone stay tappable ({prev})");
     }
 }

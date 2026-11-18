@@ -46,15 +46,27 @@ public final class DiagnosticsActivity extends Activity {
 
     private TextView body;
     private String report = "";
+    private boolean perfMode = true;
+    private Button reset;
+    private Button refresh;
+    private TextView tabPerf;
+    private TextView tabNav;
+    private Appearance.Palette pal;
+    private float d;
+
+    @Override protected void attachBaseContext(Context base) {
+        super.attachBaseContext(LocaleHelper.wrap(base));
+    }
 
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
-        float d = getResources().getDisplayMetrics().density;
+        d = getResources().getDisplayMetrics().density;
+        pal = Appearance.read(this).pal;
         int p = Math.round(16 * d);
 
         LinearLayout col = new LinearLayout(this);
         col.setOrientation(LinearLayout.VERTICAL);
-        col.setBackgroundColor(0xFF101216);
+        col.setBackgroundColor(pal.base);
         col.setOnApplyWindowInsetsListener((v, wi) -> {
             android.graphics.Insets b = wi.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
             v.setPadding(p + b.left, p + b.top, p + b.right, p + b.bottom);
@@ -62,14 +74,25 @@ public final class DiagnosticsActivity extends Activity {
         });
 
         TextView head = new TextView(this);
-        head.setText("Drift: system navigation check\nRun this while Drift is the selected home app.");
-        head.setTextColor(0xFF7AA2FF);
-        head.setTextSize(15);
+        head.setText(R.string.diag_title);
+        head.setTextColor(pal.accent);
+        head.setTextSize(18);
+        head.setTypeface(Typeface.DEFAULT_BOLD);
         col.addView(head);
 
+        LinearLayout tabs = new LinearLayout(this);
+        tabs.setOrientation(LinearLayout.HORIZONTAL);
+        tabPerf = tab(R.string.diag_tab_performance, true);
+        tabNav = tab(R.string.diag_tab_navigation, false);
+        tabs.addView(tabPerf, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        tabs.addView(tabNav, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        LinearLayout.LayoutParams tp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        tp.topMargin = Math.round(10 * d);
+        tp.bottomMargin = Math.round(8 * d);
+        col.addView(tabs, tp);
+
         body = new TextView(this);
-        body.setText("Collecting...");
-        body.setTextColor(0xFFE6E8EC);
+        body.setTextColor(pal.text);
         body.setTextSize(11);
         body.setTypeface(Typeface.MONOSPACE);
         body.setTextIsSelectable(true);
@@ -79,37 +102,107 @@ public final class DiagnosticsActivity extends Activity {
 
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
+        refresh = new Button(this);
+        refresh.setText(R.string.action_refresh);
+        refresh.setOnClickListener(v -> render());
+        reset = new Button(this);
+        reset.setText(R.string.action_reset);
+        reset.setOnClickListener(v -> {
+            PerfStats.resetAll();
+            render();
+        });
         Button copy = new Button(this);
-        copy.setText("Copy");
+        copy.setText(R.string.action_copy);
         copy.setOnClickListener(v -> {
             ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
-            if (cm != null) cm.setPrimaryClip(ClipData.newPlainText("Drift report", report));
-            Toast.makeText(this, "Copied", Toast.LENGTH_SHORT).show();
+            if (cm != null) cm.setPrimaryClip(ClipData.newPlainText(getString(R.string.diag_clip_label), currentText()));
+            Toast.makeText(this, R.string.toast_copied, Toast.LENGTH_SHORT).show();
         });
         Button share = new Button(this);
-        share.setText("Share");
+        share.setText(R.string.action_share);
         share.setOnClickListener(v -> {
-            Intent i = new Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, report);
-            startActivity(Intent.createChooser(i, "Send report"));
+            Intent i = new Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, currentText());
+            startActivity(Intent.createChooser(i, getString(R.string.diag_send_report)));
         });
-        row.addView(copy, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        row.addView(share, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        for (Button bt : new Button[] {refresh, reset, copy, share}) {
+            row.addView(bt, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        }
         col.addView(row);
         setContentView(col);
+        render();
 
+        // The navigation report reads settings and runs getprop: off the main thread, and only once.
         new Thread(() -> {
             String r;
             try {
                 r = collect();
             } catch (RuntimeException e) {
-                r = "Report failed: " + e;
+                r = getString(R.string.diag_report_failed, e.toString());
             }
             final String text = r;
             runOnUiThread(() -> {
                 report = text;
-                body.setText(text);
+                if (!perfMode) render();
             });
         }, "drift-diagnostics").start();
+    }
+
+    @Override protected void onResume() {
+        super.onResume();
+        if (body != null) render();
+    }
+
+    private TextView tab(int textRes, boolean perf) {
+        TextView t = new TextView(this);
+        t.setText(textRes);
+        t.setTextSize(15);
+        t.setGravity(android.view.Gravity.CENTER);
+        t.setPadding(0, Math.round(10 * d), 0, Math.round(10 * d));
+        t.setOnClickListener(v -> {
+            perfMode = perf;
+            render();
+        });
+        return t;
+    }
+
+    private void styleTab(TextView t, boolean on) {
+        android.graphics.drawable.GradientDrawable g = new android.graphics.drawable.GradientDrawable();
+        g.setCornerRadius(Math.round(10 * d));
+        g.setColor(on ? pal.accent : pal.card);
+        t.setBackground(g);
+        t.setTextColor(on ? pal.ink : pal.text);
+    }
+
+    private String currentText() {
+        return perfMode ? perfText() : report;
+    }
+
+    private void render() {
+        styleTab(tabPerf, perfMode);
+        styleTab(tabNav, !perfMode);
+        reset.setVisibility(perfMode ? android.view.View.VISIBLE : android.view.View.GONE);
+        refresh.setVisibility(perfMode ? android.view.View.VISIBLE : android.view.View.GONE);
+        body.setText(perfMode ? perfText() : (report.isEmpty() ? getString(R.string.diag_collecting) : report));
+    }
+
+    private static String ms(long nanos) {
+        return String.format(Locale.ROOT, "%.1f", nanos / 1_000_000.0);
+    }
+
+    /** Snapshot of PerfStats: counters only, nothing is measured while this screen is closed. */
+    private String perfText() {
+        StringBuilder sb = new StringBuilder();
+        sb.append(getString(R.string.perf_intro, ms(PerfStats.FRAME_BUDGET_NS))).append("\n\n");
+        for (PerfStats.Stat st : PerfStats.ALL) {
+            long[] v = st.snapshot();
+            sb.append(getString(st.labelRes)).append('\n');
+            if (v[0] == 0) {
+                sb.append("  ").append(getString(R.string.perf_no_samples)).append("\n\n");
+                continue;
+            }
+            sb.append("  ").append(getString(R.string.perf_row, v[0], ms(v[1]), ms(v[2]), ms(v[3]), v[4])).append("\n\n");
+        }
+        return sb.toString();
     }
 
     // ---- report ----------------------------------------------------------------
@@ -127,7 +220,7 @@ public final class DiagnosticsActivity extends Activity {
         StringBuilder sb = new StringBuilder();
         PackageManager pm = getPackageManager();
 
-        section(sb, "Device");
+        section(sb, getString(R.string.diag_sec_device));
         kv(sb, "manufacturer / brand", Build.MANUFACTURER + " / " + Build.BRAND);
         kv(sb, "model / device", Build.MODEL + " / " + Build.DEVICE);
         kv(sb, "android", Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + "), patch " + Build.VERSION.SECURITY_PATCH);
@@ -135,14 +228,14 @@ public final class DiagnosticsActivity extends Activity {
         kv(sb, "fingerprint", Build.FINGERPRINT);
         sb.append("vendor properties (emui/harmony/hw/honor/magic):\n").append(vendorProps());
 
-        section(sb, "Navigation settings");
+        section(sb, getString(R.string.diag_sec_nav));
         kv(sb, "Settings.Secure navigation_mode", Settings.Secure.getInt(getContentResolver(), "navigation_mode", -1)
             + "  (0 = 3 buttons, 1 = 2 buttons, 2 = gestures, -1 = not set here)");
         Integer cfgMode = systemInt("config_navBarInteractionMode");
         kv(sb, "config_navBarInteractionMode", cfgMode == null ? "not exposed" : cfgMode);
         sb.append("settings with nav/gesture/swipe/recent/launcher in the name:\n").append(settingsDump());
 
-        section(sb, "Home role");
+        section(sb, getString(R.string.diag_sec_home));
         boolean ours = false;
         try {
             RoleManager rm = getSystemService(RoleManager.class);
@@ -161,7 +254,7 @@ public final class DiagnosticsActivity extends Activity {
             sb.append("  ").append(ri.activityInfo.packageName).append(version(pm, ri.activityInfo.packageName)).append('\n');
         }
 
-        section(sb, "Recents / gesture provider");
+        section(sb, getString(R.string.diag_sec_recents));
         String recents = systemString("config_recentsComponentName");
         kv(sb, "config_recentsComponentName", recents == null || recents.isEmpty() ? "not exposed / empty" : recents);
         ComponentName rc = recents == null ? null : ComponentName.unflattenFromString(recents);
@@ -179,39 +272,23 @@ public final class DiagnosticsActivity extends Activity {
             if (ri.serviceInfo.packageName.equals(recentsPkg)) quickstepInRecentsPkg = true;
         }
 
-        section(sb, "Accessibility");
+        section(sb, getString(R.string.diag_sec_access));
         kv(sb, "Drift previews service enabled", ThumbService.isEnabled(this));
         kv(sb, "enabled services", Settings.Secure.getString(getContentResolver(), Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES));
 
-        section(sb, "Reading this report");
+        section(sb, getString(R.string.diag_sec_reading));
         sb.append(verdict(ours, defPkg, recentsPkg, quickstepInRecentsPkg, !qs.isEmpty()));
-        sb.append("\nDrift itself does not hide system bars, exclude gestures, touch the task stack or call\n");
-        sb.append("any recents API; it only holds the home role.\n");
+        sb.append('\n').append(getString(R.string.diag_footer)).append('\n');
         return sb.toString();
     }
 
     private String verdict(boolean ours, String defPkg, String recentsPkg, boolean quickstepInRecentsPkg, boolean anyQuickstep) {
-        if (!ours) {
-            return "Drift is not the selected home app right now, so this report describes the stock setup.\n"
-                + "Select Drift as home (Settings > Apps > Default apps > Home app) and run it again.\n";
-        }
-        if (recentsPkg == null) {
-            return "This firmware does not expose the stock recents component. Recents and gestures are then\n"
-                + "implemented by the manufacturer's own system UI, and how they behave when another app\n"
-                + "holds the home role is decided by that firmware, not by the home app.\n";
-        }
-        if (quickstepInRecentsPkg) {
-            return "Stock Quickstep layout: the gesture/recents service lives in " + recentsPkg + ", not in the home app.\n"
-                + "AOSP keeps it working for any home app through a fallback recents activity in that same\n"
-                + "package, so with this layout system navigation should not depend on Drift. If it still\n"
-                + "misbehaves, send this report: that would point to a firmware bug.\n";
-        }
-        String where = anyQuickstep ? "in another package" : "nowhere on this device";
-        return "The recents package is " + recentsPkg + " but the stock gesture service (QUICKSTEP_SERVICE) is " + where + ".\n"
-            + "So recents and swipe-between-apps here are the manufacturer's own implementation, tied to its\n"
-            + "system launcher (" + recentsPkg + (defPkg != null ? ", default home now: " + defPkg : "") + ").\n"
-            + "Whether that implementation still works when a third-party app holds the home role is a firmware\n"
-            + "decision. An app cannot add it through its manifest or window code.\n";
+        if (!ours) return getString(R.string.diag_verdict_not_home) + "\n";
+        if (recentsPkg == null) return getString(R.string.diag_verdict_no_recents) + "\n";
+        if (quickstepInRecentsPkg) return getString(R.string.diag_verdict_stock, recentsPkg) + "\n";
+        String where = getString(anyQuickstep ? R.string.diag_where_other : R.string.diag_where_none);
+        String def = defPkg != null ? getString(R.string.diag_default_home_now, defPkg) : "";
+        return getString(R.string.diag_verdict_vendor, recentsPkg, where, recentsPkg, def) + "\n";
     }
 
     private static String version(PackageManager pm, String pkg) {

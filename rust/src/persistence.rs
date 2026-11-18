@@ -1,5 +1,8 @@
 //! Durable workspace state: versioned JSON, atomic writes, corruption recovery.
 //!
+//! Migration: a file of an older version is copied to `<file>.v<N>` once (before anything
+//! overwrites it) and then loaded in the current format.
+//!
 //! Write: serialize -> `<file>.tmp` -> fsync -> keep the previous good file as
 //! `<file>.bak` -> rename over `<file>`. A crash leaves either the old or the
 //! new complete file. Read: try the main file, then the backup; an unparseable
@@ -16,7 +19,13 @@ use serde::{Deserialize, Serialize};
 use crate::config::Config;
 use crate::dock::Dock;
 
-pub const VERSION: u32 = 1;
+/// Format version written by this build.
+/// - v1: five-slot dock stored as a bare array of `null | "key"`.
+/// - v2: dock with 3..=8 slots whose entries are apps or folders (`dock::Dock`).
+///
+/// Older builds reject a file whose version is newer than theirs (it is moved aside to
+/// `.corrupt.<ts>`, never half-read), and this build reads every older version.
+pub const VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CardRecord {
@@ -143,6 +152,14 @@ pub fn sanitize(state: &mut SavedState) {
     state.camera.zoom = state.camera.zoom.clamp(0.01, 10.0);
 }
 
+/// Keep a pristine copy of a pre-migration file next to it (once per version).
+fn preserve_old_version(path: &Path, bytes: &[u8], version: u32) {
+    let copy = sibling(path, &format!(".v{version}"));
+    if !copy.exists() {
+        let _ = fs::write(copy, bytes);
+    }
+}
+
 pub fn load(path: &Path) -> (SavedState, LoadSource) {
     let backup = sibling(path, ".bak");
     let mut had_file = false;
@@ -151,6 +168,10 @@ pub fn load(path: &Path) -> (SavedState, LoadSource) {
         had_file = true;
         match parse(&bytes) {
             Some(mut s) => {
+                if s.version < VERSION {
+                    preserve_old_version(path, &bytes, s.version);
+                    s.version = VERSION;
+                }
                 sanitize(&mut s);
                 return (s, LoadSource::Main);
             }
@@ -160,6 +181,10 @@ pub fn load(path: &Path) -> (SavedState, LoadSource) {
     if let Ok(bytes) = fs::read(&backup) {
         had_file = true;
         if let Some(mut s) = parse(&bytes) {
+            if s.version < VERSION {
+                preserve_old_version(path, &bytes, s.version);
+                s.version = VERSION;
+            }
             sanitize(&mut s);
             return (s, LoadSource::Backup);
         }
@@ -254,6 +279,93 @@ mod tests {
         s
     }
 
+    fn v1_json() -> String {
+        r#"{"version":1,"saved_at":5,"camera":{"x":-40.5,"y":12.0,"zoom":0.8},
+            "cards":[{"key":"com.a","label":"A","x":1.0,"y":2.0,"w":96.0,"h":112.0},
+                     {"key":"com.b","label":"B","x":3.0,"y":4.0,"w":96.0,"h":112.0,"preview":false}],
+            "dock":["com.a",null,"com.b",null,null],
+            "recents":["com.b","com.a"],"selected":"com.a"}"#
+            .to_owned()
+    }
+
+    #[test]
+    fn v1_layout_migrates_without_losing_anything() {
+        let d = tmpdir("v1");
+        let p = d.join("state.json");
+        fs::write(&p, v1_json()).unwrap();
+        let (s, src) = load(&p);
+        assert_eq!(src, LoadSource::Main);
+        assert_eq!(s.version, VERSION);
+        assert_eq!(s.camera, CameraRecord { x: -40.5, y: 12.0, zoom: 0.8 });
+        assert_eq!(s.cards.len(), 2);
+        assert!(!s.cards[1].preview);
+        assert_eq!(s.dock.count(), 5);
+        assert_eq!(s.dock.app_at(0), Some("com.a"));
+        assert_eq!(s.dock.app_at(2), Some("com.b"));
+        assert_eq!(s.recents, vec!["com.b".to_string(), "com.a".to_string()]);
+        assert_eq!(s.selected.as_deref(), Some("com.a"));
+        // The untouched original is kept next to it.
+        let kept = fs::read_to_string(sibling(&p, ".v1")).unwrap();
+        assert_eq!(kept, v1_json());
+        // Saving writes v2, and the kept copy is not overwritten later.
+        write_atomic(&p, &to_json(&s)).unwrap();
+        let again: serde_json::Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
+        assert_eq!(again["version"], 2);
+        assert_eq!(fs::read_to_string(sibling(&p, ".v1")).unwrap(), v1_json());
+        let (back, _) = load(&p);
+        assert_eq!(back.dock, s.dock);
+    }
+
+    #[test]
+    fn v2_with_folders_round_trips_and_is_not_readable_as_v1() {
+        let d = tmpdir("v2");
+        let p = d.join("state.json");
+        let mut s = sample();
+        s.dock = Dock::with_slots(7);
+        s.dock.assign(0, "com.a");
+        let f = s.dock.create_folder(3).unwrap();
+        s.dock.folder_add(f, "com.b");
+        s.dock.folder_add(f, "com.c");
+        s.dock.folder_rename(f, "Work");
+        let empty = s.dock.create_folder(6).unwrap();
+        write_atomic(&p, &to_json(&s)).unwrap();
+        let raw: serde_json::Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
+        assert_eq!(raw["version"], 2, "a v1-only reader must see a newer version and refuse it");
+        let (back, _) = load(&p);
+        assert_eq!(back.dock, s.dock);
+        assert_eq!(back.dock.count(), 7);
+        assert_eq!(back.dock.folder(f).unwrap().apps, ["com.b", "com.c"]);
+        assert_eq!(back.dock.folder(f).unwrap().name, "Work");
+        assert!(back.dock.folder(empty).unwrap().apps.is_empty());
+        assert!(!sibling(&p, ".v1").exists(), "no migration copy for a native v2 file");
+    }
+
+    #[test]
+    fn camera_and_card_order_survive() {
+        let d = tmpdir("order");
+        let p = d.join("state.json");
+        let mut s = sample();
+        s.camera = CameraRecord { x: 1e6 + 0.125, y: -2e6, zoom: 0.37 };
+        s.cards.reverse();
+        write_atomic(&p, &to_json(&s)).unwrap();
+        let (back, _) = load(&p);
+        assert_eq!(back.camera, s.camera);
+        let keys: Vec<_> = back.cards.iter().map(|c| c.key.as_str()).collect();
+        assert_eq!(keys, ["com.b", "com.a"]);
+    }
+
+    #[test]
+    fn v1_backup_is_migrated_too() {
+        let d = tmpdir("v1bak");
+        let p = d.join("state.json");
+        fs::write(&p, b"{ torn").unwrap();
+        fs::write(sibling(&p, ".bak"), v1_json()).unwrap();
+        let (s, src) = load(&p);
+        assert_eq!(src, LoadSource::Backup);
+        assert_eq!(s.version, VERSION);
+        assert_eq!(s.dock.app_at(2), Some("com.b"));
+    }
+
     #[test]
     fn round_trip() {
         let d = tmpdir("rt");
@@ -344,7 +456,7 @@ mod tests {
         let (s, src) = load(&p);
         assert_eq!(src, LoadSource::Main);
         assert!(s.cards.is_empty());
-        assert_eq!(s.dock.slots().len(), 5);
+        assert_eq!(s.dock.count(), 5);
     }
 
     #[test]

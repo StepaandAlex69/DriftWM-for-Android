@@ -4,6 +4,7 @@ pub mod dock;
 pub mod drawer;
 pub mod gestures;
 pub mod launcher;
+pub mod messages;
 pub mod persistence;
 pub mod placement;
 pub mod render;

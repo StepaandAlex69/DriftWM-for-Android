@@ -36,7 +36,7 @@ import java.util.List;
  * draws its display list, and carries out the events the core emits (start an
  * app, open the app list, show the dock menu, save).
  */
-public final class LauncherActivity extends Activity implements CanvasView.Host, DrawerView.Callback {
+public final class LauncherActivity extends Activity implements CanvasView.Host, DrawerView.Callback, FolderView.Callback {
     private static final long SAVE_DEBOUNCE_MS = 400;
 
     private AppRepo repo;
@@ -44,12 +44,15 @@ public final class LauncherActivity extends Activity implements CanvasView.Host,
     private ThumbCache thumbs;
     private CanvasView canvas;
     private DrawerView drawer;
+    private FolderView folder;
+    private boolean resumed;
+    private String langAtCreate = "";
     private FrameLayout root;
     private Toast toast;
 
     private HandlerThread saveThread;
     private Handler saveHandler;
-    private final Runnable saveTask = Native::save;
+    private final Runnable saveTask = Native::save; // runs on the save thread only
     private OnBackInvokedCallback backCallback;
 
     private boolean ready;
@@ -58,8 +61,14 @@ public final class LauncherActivity extends Activity implements CanvasView.Host,
     private long appearanceRev = -1;
     private int appearanceGen;
 
+    @Override protected void attachBaseContext(android.content.Context base) {
+        super.attachBaseContext(LocaleHelper.wrap(base));
+    }
+
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
+        PerfStats.activityCreated();
+        langAtCreate = LocaleHelper.forced(this);
         installCrashRecorder();
         String previous = readCrash();
         if (previous != null) {
@@ -85,9 +94,9 @@ public final class LauncherActivity extends Activity implements CanvasView.Host,
         File stateFile = new File(getFilesDir(), "workspace.json");
         int loaded = Native.init(stateFile.getAbsolutePath());
         if (loaded == 2) {
-            toast("Workspace restored from backup");
+            toast(getString(R.string.toast_restored_backup));
         } else if (loaded == 3) {
-            toast("Saved workspace was unreadable; started empty (old file kept)");
+            toast(getString(R.string.toast_state_unreadable));
         }
 
         saveThread = new HandlerThread("drift-save");
@@ -96,25 +105,32 @@ public final class LauncherActivity extends Activity implements CanvasView.Host,
 
         float density = getResources().getDisplayMetrics().density;
         repo = new AppRepo(this);
-        icons = new IconCache(repo, density);
+        icons = new IconCache(this, repo, density);
+        repo.attachIcons(icons);
         thumbs = new ThumbCache(this);
         ThumbStore.setListener(thumbs);
         thumbs.setListener(() -> canvas.invalidate());
         canvas = new CanvasView(this, icons, thumbs);
         drawer = new DrawerView(this, repo, icons);
+        folder = new FolderView(this, repo, icons);
         canvas.setHost(this);
         drawer.setCallback(this);
+        folder.setCallback(this);
         icons.setListener(() -> {
             canvas.invalidate();
             drawer.iconsLoaded();
+            folder.iconsLoaded();
         });
         repo.setListener(() -> {
             drawer.refresh();
+            folder.refresh();
             canvas.invalidate();
         });
 
         root = new FrameLayout(this);
         root.addView(canvas, new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        root.addView(folder, new FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         root.addView(drawer, new FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
@@ -128,6 +144,7 @@ public final class LauncherActivity extends Activity implements CanvasView.Host,
             ThumbStore.cropBottom = sb.bottom;
             canvas.setInsets(Math.max(sb.left, sg.left), sb.top, Math.max(sb.right, sg.right), sb.bottom);
             drawer.setInsets(sb.left, sb.top, sb.right, Math.max(sb.bottom, ime.bottom));
+            folder.setInsets(sb.left, sb.top, sb.right, sb.bottom);
             return WindowInsets.CONSUMED;
         });
         setContentView(root);
@@ -144,17 +161,29 @@ public final class LauncherActivity extends Activity implements CanvasView.Host,
     @Override protected void onResume() {
         super.onResume();
         if (!ready) return;
+        long t0 = System.nanoTime();
+        PerfStats.resumeStarted();
+        resumed = true;
+        if (!LocaleHelper.forced(this).equals(langAtCreate)) { // language was changed in settings
+            recreate();
+            return;
+        }
         Native.resetClock();
         refreshAppearance(); // may have changed in Drift settings
-        repo.scheduleRefresh();
+        repo.refreshIfStale(); // LauncherApps callbacks keep the list current; full read at most once a minute
+        icons.retryFailed();
         canvas.invalidate();
+        PerfStats.RESUME.add(System.nanoTime() - t0, 0);
     }
 
     @Override protected void onPause() {
-        // The process can be killed while another app is in front: persist now.
+        resumed = false;
+        // The process can be killed while another app is in front: persist now, but without file I/O
+        // on the main thread. The snapshot is taken here (memory only); the save thread writes it.
         if (ready) {
             saveHandler.removeCallbacks(saveTask);
-            Native.save();
+            final String json = Native.snapshot();
+            if (json != null) saveHandler.post(() -> Native.writeSnapshot(json));
         }
         super.onPause();
     }
@@ -162,11 +191,14 @@ public final class LauncherActivity extends Activity implements CanvasView.Host,
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         if (!ready) return;
-        // Home pressed while the launcher is already showing.
-        if (drawer.isShowing()) {
-            drawer.hide();
+        boolean alreadyHome = resumed; // Home pressed while the launcher is already in front
+        if (drawer.isShowing()) drawer.hide();
+        if (folder.isShowing()) folder.close();
+        if (alreadyHome) {
+            Native.homePressed(); // deselect / back to the home view
+        } else {
+            Native.onHome(); // returning from an app: never move the camera
         }
-        Native.onHome();
         canvas.invalidate();
     }
 
@@ -190,6 +222,8 @@ public final class LauncherActivity extends Activity implements CanvasView.Host,
         if (!ready) return;
         if (drawer.isShowing()) {
             drawer.hide();
+        } else if (folder.isShowing()) {
+            folder.close();
         } else if (Native.onBack()) {
             canvas.invalidate();
         }
@@ -209,11 +243,20 @@ public final class LauncherActivity extends Activity implements CanvasView.Host,
                 case "drawer":
                     showDrawer(parseInt(arg, -1));
                     break;
-                case "dockmenu":
-                    showDockMenu(parseInt(arg, 0));
+                case "dockmenu": {
+                    int slot = parseInt(arg, 0);
+                    if (canvas.folderIdAtSlot(slot) >= 0) showFolderMenu(slot, canvas.folderIdAtSlot(slot));
+                    else showDockMenu(slot);
+                    break;
+                }
+                case "dockempty":
+                    showEmptySlotMenu(parseInt(arg, 0));
+                    break;
+                case "folder":
+                    openFolder(parseInt(arg, -1));
                     break;
                 case "toast":
-                    toast(arg);
+                    coreToast(arg);
                     break;
                 case "haptic":
                     canvas.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
@@ -233,7 +276,7 @@ public final class LauncherActivity extends Activity implements CanvasView.Host,
             drawer.hide();
         }
         if (!repo.launch(key)) {
-            toast("Can't open " + repo.label(key));
+            toast(getString(R.string.toast_cant_open, repo.label(key)));
             repo.scheduleRefresh();
         }
     }
@@ -291,10 +334,6 @@ public final class LauncherActivity extends Activity implements CanvasView.Host,
         }
     }
 
-    private static String tr(String en, String ru) {
-        return java.util.Locale.getDefault().getLanguage().equals("ru") ? ru : en;
-    }
-
     /** One-time (up to three times) explanation of the optional preview service. */
     private void offerPreviews() {
         if (ThumbService.isEnabled(this)) return;
@@ -302,27 +341,20 @@ public final class LauncherActivity extends Activity implements CanvasView.Host,
         int asked = prefs.getInt("preview_prompts", 0);
         if (asked >= 3) return;
         prefs.edit().putInt("preview_prompts", asked + 1).apply();
-        new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-            .setTitle(tr("App previews on cards", "Миниатюры приложений на карточках"))
-            .setMessage(tr(
-                "Android does not let a launcher see other apps. To show what each app looked like when you left it, "
-                    + "Drift needs its optional \"Drift previews\" accessibility service. It only takes a small screenshot "
-                    + "about a second after you use an app, cannot read text, passwords or notifications, "
-                    + "skips apps that block screenshots, and keeps pictures on this phone.\n\n"
-                    + "If the switch is greyed out: App info > menu > Allow restricted settings.",
-                "Android не позволяет лаунчеру видеть другие приложения. Чтобы на карточке было видно, как выглядело "
-                    + "приложение, когда вы из него вышли, Drift нужна необязательная служба «Drift previews» в "
-                    + "специальных возможностях. Она делает небольшой снимок экрана примерно через секунду после "
-                    + "ваших действий в приложении, не читает текст, пароли и уведомления, пропускает приложения, "
-                    + "которые запрещают скриншоты, и хранит картинки только на этом телефоне.\n\n"
-                    + "Если переключатель неактивен: Сведения о приложении > меню > Разрешить ограниченные настройки."))
-            .setPositiveButton(tr("Open settings", "Открыть настройки"), (d, i) ->
+        dialog()
+            .setTitle(R.string.previews_title)
+            .setMessage(R.string.previews_message)
+            .setPositiveButton(R.string.action_open_settings, (d, i) ->
                 startActivity(new Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS)))
-            .setNeutralButton(tr("App info", "Сведения о приложении"), (d, i) ->
+            .setNeutralButton(R.string.action_app_info, (d, i) ->
                 startActivity(new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
                     android.net.Uri.parse("package:" + getPackageName()))))
-            .setNegativeButton(tr("Not now", "Не сейчас"), null)
+            .setNegativeButton(R.string.action_not_now, null)
             .show();
+    }
+
+    private AlertDialog.Builder dialog() {
+        return new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert);
     }
 
     private void showDrawer(int slot) {
@@ -331,12 +363,14 @@ public final class LauncherActivity extends Activity implements CanvasView.Host,
     }
 
     private void showDockMenu(int slot) {
-        String[] items = {"Replace app", "Remove from dock"};
-        new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-            .setTitle("Dock slot " + (slot + 1))
+        String[] items = {getString(R.string.dock_replace), getString(R.string.dock_create_folder),
+            getString(R.string.dock_remove)};
+        dialog().setTitle(getString(R.string.dock_slot_title, slot + 1))
             .setItems(items, (d, which) -> {
                 if (which == 0) {
                     Native.dockReplace(slot);
+                } else if (which == 1) {
+                    createFolder(slot);
                 } else {
                     Native.dockRemove(slot);
                 }
@@ -345,9 +379,129 @@ public final class LauncherActivity extends Activity implements CanvasView.Host,
             .show();
     }
 
+    private void showEmptySlotMenu(int slot) {
+        String[] items = {getString(R.string.dock_add_app), getString(R.string.dock_create_folder)};
+        dialog().setTitle(getString(R.string.dock_slot_title, slot + 1))
+            .setItems(items, (d, which) -> {
+                if (which == 0) Native.dockReplace(slot);
+                else createFolder(slot);
+                canvas.invalidate();
+            })
+            .show();
+    }
+
+    private void showFolderMenu(int slot, int id) {
+        String[] items = {getString(R.string.folder_menu_open_folder), getString(R.string.folder_rename),
+            getString(R.string.dock_remove)};
+        dialog().setTitle(folderName(id))
+            .setItems(items, (d, which) -> {
+                if (which == 0) openFolder(id);
+                else if (which == 1) showRename(id);
+                else confirmRemoveFolder(slot, id);
+            })
+            .show();
+    }
+
+    private String folderName(int id) {
+        String n = Native.dockFolderName(id);
+        return n == null || n.isEmpty() ? getString(R.string.folder_default_name) : n;
+    }
+
+    private void createFolder(int slot) {
+        int id = Native.dockCreateFolder(slot);
+        if (id < 0) {
+            toast(getString(R.string.toast_folder_failed));
+            return;
+        }
+        canvas.invalidate();
+        openFolder(id); // the slot's app is its first app
+    }
+
+    private void openFolder(int id) {
+        if (id < 0) return;
+        folder.open(id);
+    }
+
+    /** Removing a folder from the dock keeps its apps in the app list; ask first when it is not empty. */
+    private void confirmRemoveFolder(int slot, int id) {
+        String[] apps = Native.dockFolderApps(id);
+        int n = apps == null ? 0 : apps.length;
+        Runnable remove = () -> {
+            Native.dockRemove(slot);
+            canvas.invalidate();
+        };
+        if (n == 0) {
+            remove.run();
+            return;
+        }
+        dialog().setMessage(getString(R.string.confirm_remove_folder, folderName(id), n))
+            .setPositiveButton(R.string.action_remove, (d, w) -> remove.run())
+            .setNegativeButton(android.R.string.cancel, null)
+            .show();
+    }
+
+    private void showRename(int id) {
+        final android.widget.EditText input = new android.widget.EditText(this);
+        input.setSingleLine(true);
+        input.setFilters(new android.text.InputFilter[] {new android.text.InputFilter.LengthFilter(32)});
+        String cur = Native.dockFolderName(id);
+        input.setText(cur == null ? "" : cur);
+        input.setSelectAllOnFocus(true);
+        input.setHint(R.string.folder_default_name);
+        int pad = Math.round(20 * getResources().getDisplayMetrics().density);
+        FrameLayout box = new FrameLayout(this);
+        box.setPadding(pad, pad / 2, pad, 0);
+        box.addView(input);
+        dialog().setTitle(R.string.folder_rename)
+            .setView(box)
+            .setPositiveButton(android.R.string.ok, (d, w) -> {
+                Native.dockRenameFolder(id, input.getText().toString().trim());
+                folder.refresh();
+                canvas.invalidate();
+            })
+            .setNegativeButton(android.R.string.cancel, null)
+            .show();
+    }
+
+    // ---- folder callbacks ------------------------------------------------------
+
+    @Override public void onLaunch(String key) {
+        folder.close();
+        launch(key);
+    }
+
+    @Override public void onAddApp(int folderId) {
+        drawer.showForFolder(folderId, folderName(folderId));
+        updateBars();
+    }
+
+    @Override public void onRename(int folderId) {
+        showRename(folderId);
+    }
+
+    @Override public void onChanged() {
+        canvas.invalidate();
+    }
+
+    @Override public void onClosed() {
+        canvas.invalidate();
+    }
+
     // ---- drawer callbacks ------------------------------------------------------
 
     @Override public void onPick(String key) {
+        int fid = drawer.folderMode();
+        if (fid >= 0) { // adding to a dock folder: the core owns the dock, Java only reports
+            int res = Native.dockAddApp(fid, key);
+            drawer.hide();
+            if (res == 1) toast(getString(R.string.msg_folder_already_has_app));
+            else if (res == 2) toast(getString(R.string.msg_folder_gone));
+            else if (res == 3) toast(getString(R.string.msg_dock_app_not_installed));
+            if (res == 2) folder.close();
+            else folder.refresh();
+            canvas.invalidate();
+            return;
+        }
         // The core decides: jump to an existing card, create + launch, or fill a dock slot.
         Native.drawerPick(key);
         drawer.hide();
@@ -415,7 +569,7 @@ public final class LauncherActivity extends Activity implements CanvasView.Host,
         col.setPadding(p, p * 3, p, p * 3);
         col.setBackgroundColor(0xFF101216);
         TextView head = new TextView(this);
-        head.setText("Drift crashed. Details (select and copy, or send to the developer):");
+        head.setText(R.string.crash_title);
         head.setTextColor(0xFFE5766B);
         head.setTextSize(15);
         col.addView(head);
@@ -429,7 +583,7 @@ public final class LauncherActivity extends Activity implements CanvasView.Host,
         sv.addView(body);
         col.addView(sv, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
         Button retry = new Button(this);
-        retry.setText("Clear report and retry");
+        retry.setText(R.string.crash_retry);
         retry.setOnClickListener(v -> {
             crashFile().delete();
             recreate();
@@ -439,6 +593,15 @@ public final class LauncherActivity extends Activity implements CanvasView.Host,
     }
 
     // ---- helpers ---------------------------------------------------------------
+
+    /** Toast event from the core: "<code>\t<arg>" is shown from the string resource msg_<code>. */
+    private void coreToast(String payload) {
+        String[] p = payload.split("\t", 2);
+        int id = getResources().getIdentifier("msg_" + p[0], "string", getPackageName());
+        String arg = p.length > 1 ? p[1] : "";
+        if (id == 0) return; // unknown code: checked by tools/check_l10n.py, never show raw core text
+        toast(getString(id, arg));
+    }
 
     private void toast(String msg) {
         if (toast != null) toast.cancel();

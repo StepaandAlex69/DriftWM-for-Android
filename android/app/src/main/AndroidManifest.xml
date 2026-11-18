@@ -58,13 +58,13 @@
         <activity
             android:name=".SettingsActivity"
             android:exported="false"
-            android:label="Drift settings" />
+            android:label="@string/drift_settings" />
 
         <!-- Read-only report about system navigation on this firmware; opened from Drift's app list. -->
         <activity
             android:name=".DiagnosticsActivity"
             android:exported="true"
-            android:label="Drift diagnostics">
+            android:label="@string/diag_label">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

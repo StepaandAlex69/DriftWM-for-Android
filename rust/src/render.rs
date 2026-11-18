@@ -9,7 +9,8 @@
 //!   an f32 high part and an f32 remainder so a background tiled on the canvas stays
 //!   exact far from the origin), then `n_cards * CARD_STRIDE`, `n_links * LINK_STRIDE`, `n_ui * UI_STRIDE`.
 
-use crate::launcher::Launcher;
+use crate::dock::DockItem;
+use crate::launcher::{LIFT_RISE_DP, LIFT_SCALE, Launcher};
 use crate::ui::UiId;
 use crate::workspace::{Rect, Vec2};
 
@@ -29,6 +30,8 @@ pub const UI_PRESSED: u32 = 1;
 pub const UI_FILLED: u32 = 2;
 pub const UI_DRAG_OVER: u32 = 4;
 pub const UI_DRAG_SOURCE: u32 = 8;
+/// The dock slot holds a folder (UI_FILLED is set for any occupied slot).
+pub const UI_FOLDER: u32 = 16;
 
 /// Dots closer than this (dp) are skipped by doubling the spacing, so the grid
 /// stays readable and cheap at every zoom level.
@@ -60,16 +63,33 @@ impl Launcher {
     }
 
     /// Strings the view needs next to the numeric display list, one record per
-    /// line: `c\tkey\tlabel\tavail` for each card in z-order, `d\tslot\tkey`
-    /// for each filled dock slot. Cards appear in the same order as the list.
+    /// line: `c\tkey\tlabel\tavail` for each card in z-order (same order as the
+    /// display list), `d\tslot\tkey` for each dock slot holding an app, and
+    /// `f\tslot\tid\tname\tcount\tk1\tk2\tk3\tk4` for each folder (name empty = default,
+    /// `kN` the first four apps for the dock tile's mini grid). `p\tn` carries the slot count.
     pub fn string_table(&self) -> String {
         let mut s = String::new();
         for c in &self.cards {
             s.push_str(&format!("c\t{}\t{}\t{}\n", c.key, c.label.replace(['\t', '\n'], " "), u8::from(c.available)));
         }
+        s.push_str(&format!("p\t{}\n", self.dock.count()));
         for (i, slot) in self.dock.slots().iter().enumerate() {
-            if let Some(k) = slot {
-                s.push_str(&format!("d\t{i}\t{k}\n"));
+            match slot {
+                Some(DockItem::App(k)) => s.push_str(&format!("d\t{i}\t{k}\n")),
+                Some(DockItem::Folder(f)) => {
+                    let first: Vec<&str> = (0..4).map(|n| f.apps.get(n).map_or("", String::as_str)).collect();
+                    s.push_str(&format!(
+                        "f\t{i}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                        f.id,
+                        f.name,
+                        f.apps.len(),
+                        first[0],
+                        first[1],
+                        first[2],
+                        first[3]
+                    ));
+                }
+                None => {}
             }
         }
         s
@@ -105,12 +125,11 @@ impl Launcher {
         let snap_flags = self.drag_snap_flags();
         let dock_drag = self.dock_drag();
 
-        let (pairs, groups) = {
-            let g = self.geometry();
-            (g.pairs.clone(), g.groups.clone())
-        };
+        let _ = self.geometry();
+        let geom = self.geom.as_ref().expect("geometry was just built");
+        let (pairs, groups) = (&geom.pairs, &geom.groups);
         let mut sizes = vec![0u32; self.cards.len()];
-        for &g in &groups {
+        for &g in groups {
             sizes[g] += 1;
         }
 
@@ -124,7 +143,15 @@ impl Launcher {
         let mut card_data: Vec<f32> = Vec::new();
         let mut n_cards = 0usize;
         for (i, c) in self.cards.iter().enumerate() {
-            let r = sr(&c.rect);
+            let mut r = sr(&c.rect);
+            let lift = self.lift_of(c.id);
+            if lift > 0.0 {
+                // Picked-up card: eased, no overshoot. A lone card grows a little; a group only
+                // rises, so its members keep their exact relative positions.
+                let k = if self.lift.single { 1.0 + LIFT_SCALE * lift } else { 1.0 };
+                let (cx, cy) = (r.x + r.w / 2.0, r.y + r.h / 2.0);
+                r = Rect::new(cx - r.w * k / 2.0, cy - r.h * k / 2.0 - LIFT_RISE_DP * lift, r.w * k, r.h * k);
+            }
             if !r.intersects(&screen) {
                 continue;
             }
@@ -133,8 +160,10 @@ impl Launcher {
             if self.selected == Some(c.id) {
                 flags |= CARD_SELECTED;
             }
-            if dragging == Some(c.id) {
+            if lift > 0.0 {
                 flags |= CARD_DRAGGING;
+            }
+            if dragging == Some(c.id) {
                 if snap_flags & 1 != 0 {
                     flags |= CARD_SNAP_X;
                 }
@@ -163,7 +192,7 @@ impl Launcher {
 
         let mut link_data: Vec<f32> = Vec::new();
         let mut n_links = 0usize;
-        for &(a, b, _) in &pairs {
+        for &(a, b, _) in pairs {
             if !(visible[a] || visible[b]) {
                 continue;
             }
@@ -186,8 +215,10 @@ impl Launcher {
                 flags |= UI_FILLED; // preview currently shown
             }
             if let UiId::DockSlot(i) = item.id {
-                if self.dock.get(i as usize).is_some() {
-                    flags |= UI_FILLED;
+                match self.dock.get(i as usize) {
+                    Some(DockItem::Folder(_)) => flags |= UI_FILLED | UI_FOLDER,
+                    Some(DockItem::App(_)) => flags |= UI_FILLED,
+                    None => {}
                 }
                 if let Some((from, over, _)) = dock_drag {
                     if from == i as usize {
@@ -336,5 +367,58 @@ mod tests {
         let (c, k, _) = count(&b);
         assert_eq!((c, k), (2, 1));
         assert!(b[HEADER + 6] >= 0.0, "grouped card carries a group colour");
+    }
+
+    #[test]
+    fn string_table_lists_dock_apps_folders_and_slot_count() {
+        let mut l = launcher();
+        l.dock.assign(0, "p1");
+        l.dock_set_count(6);
+        let id = l.dock_create_folder(2).unwrap();
+        for k in ["p2", "p3", "p4", "p5", "p6"] {
+            l.dock_add_app(id, k);
+        }
+        l.dock_rename_folder(id, "Tools");
+        let empty = l.dock_create_folder(4).unwrap();
+        let t = l.string_table();
+        assert!(t.lines().any(|x| x == "p\t6"), "{t}");
+        assert!(t.contains("\nd\t0\tp1\n"));
+        assert!(t.contains(&format!("\nf\t2\t{id}\tTools\t5\tp2\tp3\tp4\tp5\n")), "{t}");
+        assert!(t.contains(&format!("\nf\t4\t{empty}\t\t0\t\t\t\t\n")), "{t}");
+    }
+
+    #[test]
+    fn dock_slot_flags_distinguish_apps_folders_and_empty_slots() {
+        let mut l = launcher();
+        l.dock.assign(0, "p1");
+        l.dock_create_folder(1).unwrap();
+        let mut b = Vec::new();
+        l.render(&mut b);
+        let (c, k, u) = count(&b);
+        let ui = HEADER + c * CARD_STRIDE + k * LINK_STRIDE;
+        let flags = |slot: usize| -> u32 {
+            (0..u)
+                .map(|i| ui + i * UI_STRIDE)
+                .find(|&o| b[o] == 0.0 && b[o + 1] as usize == slot)
+                .map(|o| b[o + 6] as u32)
+                .unwrap()
+        };
+        assert_eq!(flags(0) & (UI_FILLED | UI_FOLDER), UI_FILLED);
+        assert_eq!(flags(1) & (UI_FILLED | UI_FOLDER), UI_FILLED | UI_FOLDER);
+        assert_eq!(flags(2) & (UI_FILLED | UI_FOLDER), 0);
+    }
+
+    #[test]
+    fn the_dock_draws_exactly_the_configured_number_of_slots() {
+        let mut l = launcher();
+        for n in 3..=8usize {
+            l.dock_set_count(n);
+            let mut b = Vec::new();
+            l.render(&mut b);
+            let (c, k, u) = count(&b);
+            let ui = HEADER + c * CARD_STRIDE + k * LINK_STRIDE;
+            let slots = (0..u).filter(|i| b[ui + i * UI_STRIDE] == 0.0).count();
+            assert_eq!(slots, n);
+        }
     }
 }

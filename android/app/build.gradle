@@ -32,8 +32,8 @@ android {
         applicationId 'dev.drift.launcher'
         minSdk 30
         targetSdk 36
-        versionCode 1
-        versionName 'V5'
+        versionCode 6
+        versionName 'V6'
         ndk { abiFilters(*abis) }
     }
 

@@ -2,12 +2,14 @@
 //! every user-level action. The Android layer owns no logic; it forwards touches,
 //! draws the display list from `render`, and executes the `Event`s emitted here.
 
+use std::cell::RefCell;
 use std::collections::{HashSet, VecDeque};
 
 use crate::config::Config;
-use crate::dock::Dock;
+use crate::dock::{Dock, DockItem, FolderAdd, ResizePlan};
 use crate::drawer::{AppEntry, sort_apps};
 use crate::gestures::GestureState;
+use crate::messages as msg;
 use crate::persistence::{CameraRecord, CardRecord, SavedState};
 use crate::placement::choose_position;
 use crate::snapping::{self, Side, SnapRect, cluster_of};
@@ -39,9 +41,14 @@ pub enum Event {
     Launch(String),
     /// Show the all-apps list; `Some(slot)` means "pick an app for this dock slot".
     OpenDrawer(Option<usize>),
-    /// Offer replace/remove for a dock slot.
+    /// Long press on an occupied dock slot (an app or a folder).
     DockMenu(usize),
-    Toast(String),
+    /// Long press on an empty dock slot: offer "add app" / "create folder".
+    DockEmptyMenu(usize),
+    /// Open the contents of the folder with this id.
+    OpenFolder(u32),
+    /// A short notice: `code` names a localized string (see `messages`), `arg` fills it.
+    Toast { code: &'static str, arg: String },
     Haptic,
     /// Workspace changed in a way worth persisting.
     Save,
@@ -55,7 +62,9 @@ impl Event {
             Event::OpenDrawer(None) => "drawer\t-1".to_owned(),
             Event::OpenDrawer(Some(s)) => format!("drawer\t{s}"),
             Event::DockMenu(s) => format!("dockmenu\t{s}"),
-            Event::Toast(t) => format!("toast\t{t}"),
+            Event::DockEmptyMenu(s) => format!("dockempty\t{s}"),
+            Event::OpenFolder(id) => format!("folder\t{id}"),
+            Event::Toast { code, arg } => format!("toast\t{code}\t{}", arg.replace(['\t', '\n'], " ")),
             Event::Haptic => "haptic".to_owned(),
             Event::Save => "save".to_owned(),
         }
@@ -67,6 +76,29 @@ pub enum LaunchSource {
     Dock,
     Drawer,
     Card,
+}
+
+/// Pick-up animation of the card (or group) being dragged and its settling after release.
+/// Cards are tracked by id, never by index, so reordering the z-stack mid-drag cannot
+/// lose the dragged card.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Lift {
+    pub ids: Vec<u64>,
+    /// A lone card also grows a little; a group only rises, so its members cannot drift apart.
+    pub single: bool,
+    /// 0 = resting, 1 = fully lifted.
+    pub p: f64,
+    pub target: f64,
+}
+
+pub const LIFT_UP_S: f64 = 0.120;
+pub const LIFT_DOWN_S: f64 = 0.170;
+pub const LIFT_SCALE: f64 = 0.05;
+pub const LIFT_RISE_DP: f64 = 3.0;
+
+pub(crate) struct UiCache {
+    key: (u64, u64, u64, u64, u64, bool, usize),
+    layout: UiLayout,
 }
 
 pub struct Launcher {
@@ -93,6 +125,10 @@ pub struct Launcher {
     pub(crate) layout_version: u32,
     pub(crate) geom: Option<Geometry>,
     pub(crate) drawer_pick: Option<usize>,
+    pub(crate) lift: Lift,
+    /// Set when momentum starts, cleared (with a Save) when it has finished or was stopped.
+    pub(crate) coast_dirty: bool,
+    pub(crate) ui_cache: RefCell<Option<UiCache>>,
     next_id: u64,
 }
 
@@ -136,6 +172,9 @@ impl Launcher {
             layout_version: 1,
             geom: None,
             drawer_pick: None,
+            lift: Lift::default(),
+            coast_dirty: false,
+            ui_cache: RefCell::new(None),
             next_id: 1,
         }
     }
@@ -234,8 +273,12 @@ impl Launcher {
         self.events.pop_front()
     }
 
-    pub(crate) fn toast(&mut self, msg: &str) {
-        self.emit(Event::Toast(msg.to_owned()));
+    pub(crate) fn toast(&mut self, code: &'static str) {
+        self.emit(Event::Toast { code, arg: String::new() });
+    }
+
+    pub(crate) fn toast_with(&mut self, code: &'static str, arg: &str) {
+        self.emit(Event::Toast { code, arg: arg.to_owned() });
     }
 
     pub(crate) fn geometry_changed(&mut self) {
@@ -284,8 +327,27 @@ impl Launcher {
         self.geometry_changed();
     }
 
+    /// Screen-fixed controls. Cached: it is asked for several times per frame and per touch,
+    /// and only changes with the viewport, insets, selection or the dock's slot count.
     pub fn ui_layout(&self) -> UiLayout {
-        layout(self.viewport, self.insets, self.selected.is_some())
+        let b = |v: f64| v.to_bits();
+        let key = (
+            b(self.viewport.x),
+            b(self.viewport.y),
+            b(self.insets.left) ^ b(self.insets.right).rotate_left(21),
+            b(self.insets.top),
+            b(self.insets.bottom),
+            self.selected.is_some(),
+            self.dock.count(),
+        );
+        if let Some(c) = self.ui_cache.borrow().as_ref()
+            && c.key == key
+        {
+            return c.layout.clone();
+        }
+        let l = layout(self.viewport, self.insets, self.selected.is_some(), self.dock.count());
+        *self.ui_cache.borrow_mut() = Some(UiCache { key, layout: l.clone() });
+        l
     }
 
     pub fn min_zoom(&self) -> f64 {
@@ -377,7 +439,7 @@ impl Launcher {
             return;
         }
         let Some(bbox) = bounding_box(self.cards.iter().map(|c| &c.rect)) else {
-            self.toast("Nothing on the canvas yet");
+            self.toast(msg::NOTHING_ON_CANVAS);
             return;
         };
         let back = self.camera;
@@ -409,7 +471,7 @@ impl Launcher {
     pub fn cycle_recent(&mut self) {
         let ids: Vec<u64> = self.history.iter().copied().filter(|h| self.card(*h).is_some()).collect();
         if ids.len() < 2 {
-            self.toast("No other recent cards");
+            self.toast(msg::NO_OTHER_RECENT);
             return;
         }
         if self.now.saturating_sub(self.cycle_ms) > 2500 {
@@ -467,14 +529,14 @@ impl Launcher {
     pub fn pin_selected(&mut self) {
         let Some(card) = self.selected.and_then(|id| self.card(id)) else { return };
         let key = card.key.clone();
-        if self.dock.position_of(&key).is_some() {
-            self.toast("Already in the dock");
+        if self.dock.contains(&key) {
+            self.toast(msg::ALREADY_IN_DOCK);
         } else if let Some(slot) = self.dock.first_empty() {
             self.dock.assign(slot, &key);
             self.bump_layout();
             self.emit(Event::Save);
         } else {
-            self.toast("Dock is full: long-press a slot to replace it");
+            self.toast(msg::DOCK_FULL);
         }
     }
 
@@ -549,7 +611,7 @@ impl Launcher {
     /// brings that card into view (configurable); the user double-taps to open.
     pub fn launch_app(&mut self, key: &str, source: LaunchSource) {
         let Some(app) = self.apps.iter().find(|a| a.key == key).cloned() else {
-            self.toast("This app is not available");
+            self.toast(msg::APP_NOT_AVAILABLE);
             return;
         };
 
@@ -561,8 +623,8 @@ impl Launcher {
             if jump_only {
                 self.center_card(id);
             } else {
+                // Launching never moves the camera: coming back, the desktop is where it was left.
                 self.touch_history(id);
-                self.reveal_card(id);
                 self.emit(Event::Launch(key.to_owned()));
             }
             self.emit(Event::Save);
@@ -595,7 +657,6 @@ impl Launcher {
         self.bump_layout();
         self.select(Some(id));
         self.touch_history(id);
-        self.reveal_card(id);
         self.emit(Event::Launch(key.to_owned()));
         self.emit(Event::Save);
     }
@@ -604,11 +665,12 @@ impl Launcher {
         match self.drawer_pick.take() {
             Some(slot) => {
                 if self.is_installed(key) {
-                    self.dock.assign(slot, key);
-                    self.bump_layout();
-                    self.emit(Event::Save);
+                    if self.dock.assign(slot, key) {
+                        self.bump_layout();
+                        self.emit(Event::Save);
+                    }
                 } else {
-                    self.toast("This app is not available");
+                    self.toast(msg::APP_NOT_AVAILABLE);
                 }
             }
             None => self.launch_app(key, LaunchSource::Drawer),
@@ -635,9 +697,97 @@ impl Launcher {
         self.open_drawer(Some(slot));
     }
 
+    fn dock_changed(&mut self) {
+        self.bump_layout();
+        self.emit(Event::Save);
+    }
+
+    /// Turn the slot into a folder (an app there becomes its first app; an empty slot
+    /// gets an empty folder). Returns the new folder's id.
+    pub fn dock_create_folder(&mut self, slot: usize) -> Option<u32> {
+        let id = self.dock.create_folder(slot)?;
+        self.dock_changed();
+        Some(id)
+    }
+
+    /// Add an installed app to a folder, moving it out of its old place in the dock.
+    pub fn dock_add_app(&mut self, folder: u32, key: &str) -> FolderAdd {
+        if !self.is_installed(key) {
+            self.toast(msg::APP_NOT_AVAILABLE);
+            return FolderAdd::NotInstalled;
+        }
+        let r = self.dock.folder_add(folder, key);
+        match r {
+            FolderAdd::Added => self.dock_changed(),
+            FolderAdd::AlreadyInFolder => self.toast(msg::FOLDER_ALREADY_HAS_APP),
+            FolderAdd::NoSuchFolder => self.toast(msg::FOLDER_GONE),
+            FolderAdd::NotInstalled => {}
+        }
+        r
+    }
+
+    pub fn dock_remove_app(&mut self, folder: u32, key: &str) -> bool {
+        let ok = self.dock.folder_remove(folder, key);
+        if ok {
+            self.dock_changed();
+        }
+        ok
+    }
+
+    pub fn dock_move_app(&mut self, folder: u32, from: usize, to: usize) -> bool {
+        let ok = self.dock.folder_move(folder, from, to);
+        if ok {
+            self.dock_changed();
+        }
+        ok
+    }
+
+    pub fn dock_rename_folder(&mut self, folder: u32, name: &str) -> bool {
+        let ok = self.dock.folder_rename(folder, name);
+        if ok {
+            self.dock_changed();
+        }
+        ok
+    }
+
+    pub fn dock_resize_plan(&self, count: usize) -> ResizePlan {
+        self.dock.resize_plan(count)
+    }
+
+    /// Apply a new slot count (callers confirm with `dock_resize_plan` first).
+    pub fn dock_set_count(&mut self, count: usize) -> ResizePlan {
+        let before = self.dock.count();
+        let plan = self.dock.set_count(count);
+        if self.dock.count() != before || plan.occupied_beyond > 0 {
+            self.drawer_pick = None;
+            self.dock_changed();
+        }
+        plan
+    }
+
+    /// Keys of the apps in a folder, in display order.
+    pub fn dock_folder_apps(&self, folder: u32) -> Option<Vec<String>> {
+        self.dock.folder(folder).map(|f| f.apps.clone())
+    }
+
+    pub fn dock_folder_name(&self, folder: u32) -> Option<String> {
+        self.dock.folder(folder).map(|f| f.name.clone())
+    }
+
+    pub fn dock_is_app(&self, slot: usize) -> bool {
+        matches!(self.dock.get(slot), Some(DockItem::App(_)))
+    }
+
     /// Back/Home pressed while already on the launcher.
     pub fn on_home(&mut self) {
         self.select(None);
+    }
+
+    /// The Home key (or gesture) while the launcher is already in front: clear the selection
+    /// and glide to the home view; the next press returns to where you were.
+    pub fn home_pressed(&mut self) {
+        self.select(None);
+        self.toggle_home();
     }
 
     /// Advance animations. Returns true while another frame is needed.
@@ -657,6 +807,13 @@ impl Launcher {
         }
         if self.momentum.coasting {
             active = true;
+        } else if self.coast_dirty {
+            // The fling is over (finished or caught by a finger): persist where the canvas ended up.
+            self.coast_dirty = false;
+            self.emit(Event::Save);
+        }
+        if self.tick_lift(dt) {
+            active = true;
         }
         if let Some(anim) = self.anim {
             let mut cam = self.camera;
@@ -671,6 +828,51 @@ impl Launcher {
         active || self.gesture_active()
     }
 
+    /// Advance the pick-up / settle animation. True while it still moves.
+    fn tick_lift(&mut self, dt: f64) -> bool {
+        let l = &mut self.lift;
+        if l.ids.is_empty() {
+            return false;
+        }
+        if l.p < l.target {
+            l.p = (l.p + dt / LIFT_UP_S).min(l.target);
+        } else if l.p > l.target {
+            l.p = (l.p - dt / LIFT_DOWN_S).max(l.target);
+        }
+        if l.p <= 0.0 && l.target <= 0.0 {
+            l.ids.clear();
+            return false;
+        }
+        l.p != l.target
+    }
+
+    /// Start lifting `ids` (the dragged card, plus the rest of its group).
+    pub(crate) fn lift_start(&mut self, ids: Vec<u64>) {
+        let single = ids.len() == 1;
+        let same = self.lift.ids == ids;
+        self.lift = Lift {
+            ids,
+            single,
+            p: if same { self.lift.p } else { 0.0 },
+            target: 1.0,
+        };
+    }
+
+    /// Put the lifted cards down (animated).
+    pub(crate) fn lift_release(&mut self) {
+        self.lift.target = 0.0;
+    }
+
+    /// Eased lift amount (0..1) of a card, 0 when it is not lifted.
+    pub(crate) fn lift_of(&self, id: u64) -> f64 {
+        if self.lift.p > 0.0 && self.lift.ids.contains(&id) {
+            let p = self.lift.p.clamp(0.0, 1.0);
+            p * p * (3.0 - 2.0 * p) // smoothstep: no overshoot, no spring
+        } else {
+            0.0
+        }
+    }
+
     /// Call when the activity goes to background so a stale `last_tick` doesn't
     /// produce a long first step.
     pub fn reset_clock(&mut self) {
@@ -681,6 +883,7 @@ impl Launcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::UiId;
 
     pub fn apps(keys: &[&str]) -> Vec<AppEntry> {
         keys.iter().map(|k| AppEntry::new(*k, k.to_uppercase())).collect()
@@ -753,7 +956,7 @@ mod tests {
         let mut l = launcher();
         l.launch_app("ghost", LaunchSource::Dock);
         assert!(l.cards.is_empty());
-        assert!(matches!(drain(&mut l)[0], Event::Toast(_)));
+        assert!(matches!(drain(&mut l)[0], Event::Toast { .. }));
     }
 
     #[test]
@@ -812,10 +1015,10 @@ mod tests {
         }
         assert_eq!(l.dock.slots().iter().filter(|s| s.is_some()).count(), 5);
         let ev = drain(&mut l);
-        assert!(ev.iter().any(|e| matches!(e, Event::Toast(t) if t.contains("full"))));
+        assert!(ev.iter().any(|e| matches!(e, Event::Toast { code, .. } if *code == crate::messages::DOCK_FULL)));
         l.launch_app("a", LaunchSource::Dock);
         l.pin_selected();
-        assert!(drain(&mut l).iter().any(|e| matches!(e, Event::Toast(t) if t.contains("Already"))));
+        assert!(drain(&mut l).iter().any(|e| matches!(e, Event::Toast { code, .. } if *code == crate::messages::ALREADY_IN_DOCK)));
     }
 
     #[test]
@@ -823,7 +1026,7 @@ mod tests {
         let mut l = launcher();
         l.open_drawer(Some(3));
         l.drawer_pick("c");
-        assert_eq!(l.dock.get(3), Some("c"));
+        assert_eq!(l.dock.app_at(3), Some("c"));
         assert!(l.cards.is_empty());
         assert!(!drain(&mut l).iter().any(|e| matches!(e, Event::Launch(_))));
     }
@@ -981,5 +1184,159 @@ mod tests {
                 assert!(!l.cards[i].rect.intersects(&l.cards[j].rect), "{i} overlaps {j}");
             }
         }
+    }
+
+    // ---- dock folders through the core ------------------------------------------
+
+    #[test]
+    fn creating_a_folder_from_a_slot_app_and_adding_apps_goes_through_the_core() {
+        let mut l = launcher();
+        l.dock.assign(1, "a");
+        drain(&mut l);
+        let v = l.layout_version();
+        let id = l.dock_create_folder(1).unwrap();
+        assert_ne!(l.layout_version(), v, "string table changes");
+        assert_eq!(l.dock_folder_apps(id).unwrap(), ["a"]);
+        assert!(drain(&mut l).contains(&Event::Save));
+
+        assert_eq!(l.dock_add_app(id, "b"), FolderAdd::Added);
+        assert_eq!(l.dock_add_app(id, "b"), FolderAdd::AlreadyInFolder);
+        assert_eq!(l.dock_add_app(id, "ghost"), FolderAdd::NotInstalled);
+        assert_eq!(l.dock_add_app(99, "c"), FolderAdd::NoSuchFolder);
+        assert_eq!(l.dock_folder_apps(id).unwrap(), ["a", "b"]);
+        let ev = drain(&mut l);
+        assert!(ev.iter().any(|e| matches!(e, Event::Toast { code, .. } if *code == msg::FOLDER_ALREADY_HAS_APP)));
+        assert!(ev.iter().any(|e| matches!(e, Event::Toast { code, .. } if *code == msg::APP_NOT_AVAILABLE)));
+        assert!(ev.iter().any(|e| matches!(e, Event::Toast { code, .. } if *code == msg::FOLDER_GONE)));
+    }
+
+    #[test]
+    fn an_app_pinned_in_the_dock_moves_into_the_folder_instead_of_duplicating() {
+        let mut l = launcher();
+        l.dock.assign(0, "c");
+        let id = l.dock_create_folder(2).unwrap();
+        assert_eq!(l.dock_add_app(id, "c"), FolderAdd::Added);
+        assert_eq!(l.dock.app_at(0), None);
+        assert_eq!(l.dock_folder_apps(id).unwrap(), ["c"]);
+    }
+
+    #[test]
+    fn removing_and_reordering_in_a_folder_and_renaming() {
+        let mut l = launcher();
+        let id = l.dock_create_folder(0).unwrap();
+        for k in ["a", "b", "c"] {
+            l.dock_add_app(id, k);
+        }
+        assert!(l.dock_move_app(id, 2, 0));
+        assert_eq!(l.dock_folder_apps(id).unwrap(), ["c", "a", "b"]);
+        assert!(l.dock_remove_app(id, "a"));
+        assert!(l.dock_rename_folder(id, "Games"));
+        assert_eq!(l.dock_folder_name(id).unwrap(), "Games");
+        assert!(l.dock_remove_app(id, "b") && l.dock_remove_app(id, "c"));
+        assert_eq!(l.dock_folder_apps(id).unwrap().len(), 0, "an empty folder stays");
+        assert!(!l.dock_is_app(0));
+        assert!(l.dock.get(0).is_some());
+    }
+
+    #[test]
+    fn picking_an_app_for_a_folder_slot_never_overwrites_the_folder() {
+        let mut l = launcher();
+        let id = l.dock_create_folder(2).unwrap();
+        l.dock_add_app(id, "a");
+        l.open_drawer(Some(2));
+        l.drawer_pick("b");
+        assert_eq!(l.dock_folder_apps(id).unwrap(), ["a"]);
+    }
+
+    #[test]
+    fn changing_the_slot_count_keeps_everything_that_fits_and_reports_the_rest() {
+        let mut l = launcher();
+        l.dock.assign(0, "a");
+        l.dock.assign(4, "e");
+        let plan = l.dock_resize_plan(3);
+        assert_eq!(plan.occupied_beyond, 1);
+        assert_eq!(plan.lost_items, 0, "e moves into a free slot");
+        let v = l.layout_version();
+        l.dock_set_count(3);
+        assert_eq!(l.dock.count(), 3);
+        assert!(l.dock.contains("e"));
+        assert_ne!(l.layout_version(), v);
+        let layout = l.ui_layout();
+        let slots = layout.items.iter().filter(|i| matches!(i.id, UiId::DockSlot(_))).count();
+        assert_eq!(slots, 3, "the cached layout follows the slot count");
+        l.dock_set_count(8);
+        let layout = l.ui_layout();
+        assert_eq!(layout.items.iter().filter(|i| matches!(i.id, UiId::DockSlot(_))).count(), 8);
+    }
+
+    #[test]
+    fn the_slot_count_and_folders_survive_save_and_load() {
+        let mut l = launcher();
+        l.dock_set_count(7);
+        l.dock.assign(0, "a");
+        let id = l.dock_create_folder(3).unwrap();
+        l.dock_add_app(id, "b");
+        l.dock_add_app(id, "c");
+        l.dock_rename_folder(id, "Trio");
+        l.dock_create_folder(6).unwrap();
+        let json = crate::persistence::to_json(&l.to_saved());
+        let saved: crate::persistence::SavedState = serde_json::from_str(&json).unwrap();
+        let l2 = Launcher::from_saved(saved);
+        assert_eq!(l2.dock, l.dock);
+        assert_eq!(l2.dock.count(), 7);
+        assert_eq!(l2.dock_folder_apps(id).unwrap(), ["b", "c"]);
+        assert_eq!(l2.dock_folder_name(id).unwrap(), "Trio");
+    }
+
+    #[test]
+    fn ui_layout_cache_is_invalidated_by_selection_and_viewport() {
+        let mut l = launcher();
+        let a = l.ui_layout();
+        assert_eq!(a.items.len(), l.ui_layout().items.len());
+        l.launch_app("a", LaunchSource::Drawer);
+        assert!(l.ui_layout().items.len() > a.items.len(), "toolbar appears with a selection");
+        let before = l.ui_layout().rect_of(UiId::Drawer).unwrap();
+        l.set_viewport(1440.0, 2400.0, 3.0, [0.0, 72.0, 0.0, 72.0]);
+        assert_ne!(l.ui_layout().rect_of(UiId::Drawer).unwrap(), before);
+    }
+
+    #[test]
+    fn toast_events_carry_codes_not_text() {
+        let mut l = launcher();
+        l.toggle_overview();
+        let ev = drain(&mut l);
+        let enc: Vec<String> = ev.iter().map(Event::encode).collect();
+        assert!(enc.iter().any(|e| e == "toast\tnothing_on_canvas\t"), "{enc:?}");
+    }
+
+    #[test]
+    fn home_pressed_goes_home_and_the_next_press_comes_back() {
+        let mut l = launcher();
+        l.launch_app("a", LaunchSource::Drawer);
+        l.camera.pos = Vec2::new(5000.0, -3000.0);
+        let away = l.camera;
+        l.home_pressed();
+        assert_eq!(l.selected, None);
+        for i in 0..300 {
+            l.tick(1000 + i * 16);
+        }
+        assert!(l.camera.center(l.viewport).length() < 1.0);
+        l.home_pressed();
+        for i in 0..300 {
+            l.tick(9000 + i * 16);
+        }
+        assert!((l.camera.pos.x - away.pos.x).abs() < 1.0 && (l.camera.pos.y - away.pos.y).abs() < 1.0);
+    }
+
+    #[test]
+    fn home_pressed_at_home_only_deselects() {
+        let mut l = launcher();
+        l.launch_app("a", LaunchSource::Drawer);
+        l.camera = crate::workspace::Camera::centered_on(Vec2::ZERO, 1.0, l.viewport);
+        let cam = l.camera;
+        l.home_pressed();
+        assert_eq!(l.selected, None);
+        assert!(l.anim.is_none());
+        assert_eq!(l.camera, cam);
     }
 }

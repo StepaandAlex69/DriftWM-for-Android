@@ -6,7 +6,9 @@
 //! Scale handling follows DriftWM's touch recognizer: pan and zoom run together,
 //! zoom engages only after the finger spread changes by a ratio slop.
 
+use crate::dock::DockItem;
 use crate::launcher::{Event, LaunchSource, Launcher};
+use crate::messages as msg;
 use crate::snapping::{SnapConfig, SnapRect, SnapState, cluster_of, snap_move};
 use crate::ui::UiId;
 use crate::workspace::{Direction, Rect, Vec2, edge_pan_velocity, snap_zoom, zoom_anchor_camera};
@@ -327,7 +329,7 @@ impl Launcher {
                             ptr.last = p;
                         }
                     }
-                    Target::Ui(UiId::DockSlot(slot)) if long => {
+                    Target::Ui(UiId::DockSlot(slot)) if long && !self.dock.is_empty_slot(slot as usize) => {
                         self.g.mode = Mode::DockDrag {
                             pid: id,
                             from: slot as usize,
@@ -520,6 +522,9 @@ impl Launcher {
         }
         self.raise(card_id);
 
+        let mut lifted = vec![card_id];
+        lifted.extend(members.iter().map(|(id, _)| *id));
+        self.lift_start(lifted);
         let c = self.camera.screen_to_canvas(finger);
         let pos = self.card(card_id).map(|c| c.rect).unwrap_or(origin);
         self.g.mode = Mode::Drag(DragState {
@@ -590,12 +595,9 @@ impl Launcher {
             && !long
             && now.saturating_sub(down_ms) >= self.cfg.long_press_ms
         {
+            // Empty dock slots long-press too: that opens "add app / create folder".
             let allowed = matches!(target, Target::Card(_) | Target::Ui(UiId::DockSlot(_)));
-            let filled = match target {
-                Target::Ui(UiId::DockSlot(s)) => self.dock.get(s as usize).is_some(),
-                _ => true,
-            };
-            if allowed && filled {
+            if allowed {
                 self.g.mode = Mode::Pending {
                     pid,
                     target,
@@ -659,6 +661,7 @@ impl Launcher {
             Mode::Pan { pid } if pid == id => {
                 if remaining == 0 {
                     self.momentum.launch(self.now);
+                    self.coast_dirty = self.momentum.coasting;
                     self.g.mode = Mode::Idle;
                 } else {
                     self.g.mode = Mode::Ignore;
@@ -667,6 +670,7 @@ impl Launcher {
             }
             Mode::Drag(d) if d.pid == id => {
                 self.g.mode = if remaining == 0 { Mode::Idle } else { Mode::Ignore };
+                self.lift_release();
                 self.geometry_changed();
                 self.touch_history(d.card_id);
                 self.emit(Event::Save);
@@ -717,6 +721,7 @@ impl Launcher {
 
     fn on_cancel(&mut self) {
         if matches!(self.g.mode, Mode::Drag(_) | Mode::Resize { .. }) {
+            self.lift_release();
             self.geometry_changed();
             self.emit(Event::Save);
         }
@@ -786,7 +791,7 @@ impl Launcher {
         let Some(card) = self.card(id) else { return };
         if !card.available {
             let label = card.label.clone();
-            self.toast(&format!("{label} is not installed. Select it and tap remove to clear the card"));
+            self.toast_with(msg::CARD_NOT_INSTALLED, &label);
             return;
         }
         let key = card.key.clone();
@@ -797,9 +802,10 @@ impl Launcher {
         match ui {
             UiId::DockSlot(s) => {
                 let slot = s as usize;
-                match self.dock.get(slot).map(str::to_owned) {
+                match self.dock.get(slot).cloned() {
                     Some(_) if long => self.emit(Event::DockMenu(slot)),
-                    Some(key) => {
+                    Some(DockItem::Folder(f)) => self.emit(Event::OpenFolder(f.id)),
+                    Some(DockItem::App(key)) => {
                         if self.is_installed(&key) {
                             let src = if self.cfg.dock_launches_existing {
                                 LaunchSource::Dock
@@ -808,9 +814,10 @@ impl Launcher {
                             };
                             self.launch_app(&key, src);
                         } else {
-                            self.toast("This app is not installed. Long-press the slot to replace it");
+                            self.toast(msg::DOCK_APP_NOT_INSTALLED);
                         }
                     }
+                    None if long => self.emit(Event::DockEmptyMenu(slot)),
                     None => self.open_drawer(Some(slot)),
                 }
             }
@@ -1377,8 +1384,8 @@ mod tests {
         l.touch(1, 0, px(s0.x + 30.0), px(s0.y), 1520);
         l.touch(1, 0, px(s3.x), px(s3.y), 1540);
         l.touch(2, 0, px(s3.x), px(s3.y), 1560);
-        assert_eq!(l.dock.get(3), Some("a"));
-        assert_eq!(l.dock.get(0), Some("b"));
+        assert_eq!(l.dock.app_at(3), Some("a"));
+        assert_eq!(l.dock.app_at(0), Some("b"));
         assert!(l.cards.is_empty());
     }
 
@@ -1469,7 +1476,7 @@ mod tests {
         tap(&mut l, c.x, c.y, 1000);
         tap(&mut l, c.x, c.y, 1150);
         let ev = events(&mut l);
-        assert!(ev.iter().any(|e| matches!(e, Event::Toast(_))));
+        assert!(ev.iter().any(|e| matches!(e, Event::Toast { .. })));
         assert!(!ev.iter().any(|e| matches!(e, Event::Launch(_))));
     }
 
@@ -1704,5 +1711,283 @@ mod tests {
         assert!(l.card(a).unwrap().rect.w > 88.0);
         // The adjacency cache was invalidated: recomputing must not panic and must reflect the new rect.
         let _ = l.geometry().pairs.len();
+    }
+
+    // ---- dock: folders, empty slots, slot count ---------------------------------
+
+    fn long_press(l: &mut Launcher, x: f64, y: f64, t: u64) {
+        l.touch(0, 0, px(x), px(y), t);
+        l.tick(t);
+        l.tick(t + 500);
+        l.touch(2, 0, px(x), px(y), t + 520);
+    }
+
+    #[test]
+    fn tapping_a_folder_opens_it_and_long_press_opens_the_menu() {
+        let mut l = setup();
+        l.dock.assign(0, "a");
+        let id = l.dock_create_folder(0).unwrap();
+        events(&mut l);
+        let s = l.ui_layout().rect_of(UiId::DockSlot(0)).unwrap().center();
+        tap(&mut l, s.x, s.y, 1000);
+        assert!(events(&mut l).contains(&Event::OpenFolder(id)));
+        long_press(&mut l, s.x, s.y, 2000);
+        let ev = events(&mut l);
+        assert!(ev.contains(&Event::DockMenu(0)));
+        assert!(!ev.iter().any(|e| matches!(e, Event::OpenFolder(_))));
+    }
+
+    #[test]
+    fn empty_slot_tap_picks_an_app_and_long_press_offers_the_menu() {
+        let mut l = setup();
+        let s = l.ui_layout().rect_of(UiId::DockSlot(3)).unwrap().center();
+        tap(&mut l, s.x, s.y, 1000);
+        assert!(events(&mut l).contains(&Event::OpenDrawer(Some(3))));
+        l.drawer_closed();
+        long_press(&mut l, s.x, s.y, 3000);
+        let ev = events(&mut l);
+        assert!(ev.contains(&Event::DockEmptyMenu(3)));
+        assert!(!ev.iter().any(|e| matches!(e, Event::OpenDrawer(_))));
+    }
+
+    #[test]
+    fn dragging_from_an_empty_slot_does_not_reorder_the_dock() {
+        let mut l = setup();
+        l.dock.assign(1, "a");
+        let ui = l.ui_layout();
+        let s0 = ui.rect_of(UiId::DockSlot(0)).unwrap().center();
+        let s3 = ui.rect_of(UiId::DockSlot(3)).unwrap().center();
+        l.touch(0, 0, px(s0.x), px(s0.y), 1000);
+        l.tick(1000);
+        l.tick(1500);
+        l.touch(1, 0, px(s0.x + 30.0), px(s0.y), 1520);
+        l.touch(1, 0, px(s3.x), px(s3.y), 1540);
+        l.touch(2, 0, px(s3.x), px(s3.y), 1560);
+        assert_eq!(l.dock.app_at(1), Some("a"));
+    }
+
+    #[test]
+    fn a_folder_slot_can_be_dragged_like_an_app() {
+        let mut l = setup();
+        let id = l.dock_create_folder(0).unwrap();
+        let ui = l.ui_layout();
+        let s0 = ui.rect_of(UiId::DockSlot(0)).unwrap().center();
+        let s3 = ui.rect_of(UiId::DockSlot(3)).unwrap().center();
+        l.touch(0, 0, px(s0.x), px(s0.y), 1000);
+        l.tick(1000);
+        l.tick(1500);
+        l.touch(1, 0, px(s0.x + 30.0), px(s0.y), 1520);
+        l.touch(1, 0, px(s3.x), px(s3.y), 1540);
+        l.touch(2, 0, px(s3.x), px(s3.y), 1560);
+        assert_eq!(l.dock.folder_slot(id), Some(3));
+    }
+
+    #[test]
+    fn eight_slots_are_all_tappable() {
+        let mut l = setup();
+        l.dock_set_count(8);
+        let ui = l.ui_layout();
+        for i in 0..8u8 {
+            let s = ui.rect_of(UiId::DockSlot(i)).unwrap().center();
+            assert_eq!(ui.hit(s), Some(UiId::DockSlot(i)));
+        }
+        let s = ui.rect_of(UiId::DockSlot(7)).unwrap().center();
+        tap(&mut l, s.x, s.y, 1000);
+        assert!(events(&mut l).contains(&Event::OpenDrawer(Some(7))));
+    }
+
+    // ---- card pick-up animation --------------------------------------------------
+
+    fn drag_card_by(l: &mut Launcher, id: u64, dx: f64, long: bool, t0: u64) -> Finger {
+        let c = screen_of(l, id);
+        let mut f = Finger::down(l, 0, c.x, c.y, t0);
+        if long {
+            l.tick(t0);
+            l.tick(t0 + 500);
+        }
+        f.to(l, c.x + 20.0, c.y, t0 + 520);
+        f.to(l, c.x + dx, c.y, t0 + 540);
+        f
+    }
+
+    #[test]
+    fn lift_rises_in_about_120_ms_and_settles_in_about_170_ms_without_overshoot() {
+        let mut l = setup();
+        let id = put_card(&mut l, "a", 136.0, 300.0);
+        let f = drag_card_by(&mut l, id, 60.0, false, 1000);
+        let mut t = 1540;
+        let mut prev = 0.0;
+        let mut reached_at = None;
+        for step in 1..=20 {
+            t += 16;
+            l.tick(t);
+            let e = l.lift_of(id);
+            assert!(e >= prev - 1e-12 && e <= 1.0 + 1e-12, "monotone, no overshoot: {e}");
+            prev = e;
+            if reached_at.is_none() && e >= 0.999 {
+                reached_at = Some(step * 16);
+            }
+        }
+        let up = reached_at.expect("fully lifted");
+        assert!((96..=144).contains(&up), "pick-up took {up} ms");
+        f.up(&mut l, t + 16);
+        let mut down_at = None;
+        let mut prev = 1.0;
+        for step in 1..=20 {
+            t += 16;
+            l.tick(t + 16);
+            let e = l.lift_of(id);
+            assert!(e <= prev + 1e-12 && e >= 0.0, "settles monotonically: {e}");
+            prev = e;
+            if down_at.is_none() && e <= 0.0 {
+                down_at = Some(step * 16);
+            }
+        }
+        let d = down_at.expect("settled");
+        assert!((144..=208).contains(&d), "settling took {d} ms");
+        assert!(l.lift.ids.is_empty(), "animation state is released");
+    }
+
+    #[test]
+    fn a_lone_card_grows_5_percent_and_rises_3_dp_in_the_display_list() {
+        let mut l = setup();
+        let id = put_card(&mut l, "a", 136.0, 300.0);
+        let rest = {
+            let mut b = Vec::new();
+            l.render(&mut b);
+            (b[crate::render::HEADER + 3], b[crate::render::HEADER + 4], b[crate::render::HEADER + 2])
+        };
+        let _f = drag_card_by(&mut l, id, 0.0, false, 1000);
+        let mut t = 1540;
+        for _ in 0..20 {
+            t += 16;
+            l.tick(t);
+        }
+        let mut b = Vec::new();
+        l.render(&mut b);
+        let (w, h, y) = (b[crate::render::HEADER + 3], b[crate::render::HEADER + 4], b[crate::render::HEADER + 2]);
+        assert!((w / rest.0 - 1.05).abs() < 0.002, "width x{}", w / rest.0);
+        assert!((h / rest.1 - 1.05).abs() < 0.002);
+        // top edge: grows by half the extra height and moves up 3 dp
+        let expect_y = rest.2 - (h - rest.1) / 2.0 - 3.0;
+        assert!((y - expect_y).abs() < 0.05, "y {y} vs {expect_y}");
+        let flags = b[crate::render::HEADER + 5] as u32;
+        assert!(flags & crate::render::CARD_DRAGGING != 0);
+    }
+
+    #[test]
+    fn a_dragged_group_rises_together_without_scaling_so_it_cannot_fall_apart() {
+        let mut l = setup();
+        let a = put_card(&mut l, "a", 20.0, 300.0);
+        let gap = l.cfg.snap_gap;
+        let b = put_card(&mut l, "b", 20.0 + 88.0 + gap, 300.0);
+        let before: Vec<_> = [a, b].iter().map(|id| l.card(*id).unwrap().rect).collect();
+        let f = drag_card_by(&mut l, a, 40.0, true, 1000);
+        let mut t = 1540;
+        for _ in 0..20 {
+            t += 16;
+            l.tick(t);
+        }
+        assert_eq!(l.lift.ids.len(), 2);
+        assert!(!l.lift.single);
+        let mut buf = Vec::new();
+        l.render(&mut buf);
+        let h = crate::render::HEADER;
+        let (wa, ha) = (buf[h + 3], buf[h + 4]);
+        let (wb, hb) = (buf[h + 7 + 3], buf[h + 7 + 4]);
+        assert_eq!((wa, ha), (wb, hb), "members keep their size");
+        assert!((wa - 88.0 * l.camera.zoom as f32).abs() < 1e-3, "no scaling for a group");
+        // relative layout is exactly the original one
+        let ra = l.card(a).unwrap().rect;
+        let rb = l.card(b).unwrap().rect;
+        assert!(((rb.x - ra.x) - (before[1].x - before[0].x)).abs() < 1e-9);
+        assert!(((rb.y - ra.y) - (before[1].y - before[0].y)).abs() < 1e-9);
+        // identical rise for both on screen
+        assert!((buf[h + 2] - buf[h + 7 + 2]).abs() < 1e-3);
+        f.up(&mut l, t + 16);
+    }
+
+    #[test]
+    fn the_dragged_card_is_followed_by_id_when_the_z_order_changes() {
+        let mut l = setup();
+        let a = put_card(&mut l, "a", 20.0, 300.0);
+        let _b = put_card(&mut l, "b", 200.0, 300.0);
+        let _f = drag_card_by(&mut l, a, 30.0, false, 1000);
+        // Reordering the stack mid-drag (raise moves cards around in the vector).
+        let b_id = l.cards[0].id;
+        l.raise(b_id);
+        l.tick(1560);
+        l.tick(1600);
+        assert_eq!(l.dragging_card(), Some(a));
+        assert!(l.lift_of(a) > 0.0);
+        assert!(l.card(a).is_some());
+    }
+
+    // ---- camera: launching does not move it; a fling is saved when it ends -------
+
+    #[test]
+    fn launching_an_app_never_moves_the_camera() {
+        let mut l = setup();
+        let id = put_card(&mut l, "a", 8000.0, 8000.0);
+        let before = l.camera;
+        l.launch_app("a", LaunchSource::Dock);
+        for i in 0..60 {
+            l.tick(1000 + i * 16);
+        }
+        assert_eq!(l.camera, before);
+        assert!(l.anim.is_none());
+        assert_eq!(l.selected, Some(id));
+        assert!(events(&mut l).contains(&Event::Launch("a".into())));
+        // a brand-new card is created and launched without moving the view either
+        l.launch_app("b", LaunchSource::Drawer);
+        for i in 0..60 {
+            l.tick(3000 + i * 16);
+        }
+        assert_eq!(l.camera, before);
+    }
+
+    #[test]
+    fn the_final_position_after_a_fling_is_saved_when_it_stops() {
+        let mut l = setup();
+        let mut f = Finger::down(&mut l, 0, 200.0, 400.0, 1000);
+        f.to(&mut l, 180.0, 380.0, 1016);
+        f.to(&mut l, 140.0, 340.0, 1032);
+        f.to(&mut l, 80.0, 280.0, 1048);
+        f.up(&mut l, 1056);
+        assert!(l.momentum.coasting, "a quick swipe flings");
+        events(&mut l); // the Save emitted at release
+        let released_at = l.camera;
+        let mut t = 1056;
+        let mut saves_while_coasting = 0;
+        for _ in 0..600 {
+            t += 16;
+            let active = l.tick(t);
+            if l.momentum.coasting {
+                saves_while_coasting += events(&mut l).iter().filter(|e| **e == Event::Save).count();
+            }
+            if !active {
+                break;
+            }
+        }
+        assert_eq!(saves_while_coasting, 0, "no write storm during the fling");
+        assert!(l.camera != released_at, "the canvas kept moving");
+        assert!(events(&mut l).contains(&Event::Save), "saved right after the fling ended");
+    }
+
+    #[test]
+    fn stopping_a_fling_with_a_finger_also_saves() {
+        let mut l = setup();
+        let mut f = Finger::down(&mut l, 0, 200.0, 400.0, 1000);
+        f.to(&mut l, 180.0, 380.0, 1016);
+        f.to(&mut l, 140.0, 340.0, 1032);
+        f.to(&mut l, 80.0, 280.0, 1048);
+        f.up(&mut l, 1056);
+        events(&mut l);
+        l.tick(1072);
+        l.tick(1088);
+        l.touch(0, 5, px(100.0), px(300.0), 1100); // catch it
+        l.tick(1116);
+        assert!(events(&mut l).contains(&Event::Save));
+        l.touch(2, 5, px(100.0), px(300.0), 1130);
     }
 }

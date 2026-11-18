@@ -4,10 +4,11 @@ import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.BitmapShader;
 import android.graphics.Canvas;
-import android.graphics.Matrix;
 import android.graphics.DashPathEffect;
+import android.graphics.Matrix;
 import android.graphics.Paint;
 import android.graphics.Path;
+import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.Shader;
 import android.os.SystemClock;
@@ -25,6 +26,11 @@ import java.util.List;
  *
  * Display list layout (must match rust/src/render.rs):
  *   header[21], cards[n * 7], links[n * 4], ui[n * 7]
+ *
+ * Per-frame cost rules: no Paint.setShadowLayer (one translucent rounded shape under each
+ * card instead), the dot grid is one repeating BitmapShader tile, previews are drawn through
+ * a BitmapShader (rounded without clipPath/saveLayer), and nothing that does not change from
+ * frame to frame is allocated in onDraw.
  */
 final class CanvasView extends View {
     interface Host {
@@ -47,49 +53,69 @@ final class CanvasView extends View {
     private static final int UI_FILLED = 2;
     private static final int UI_DRAG_OVER = 4;
     private static final int UI_DRAG_SOURCE = 8;
+    private static final int UI_FOLDER = 16;
 
+    private static final int MAX_SLOTS = 8;
     private static final int SNAP = 0xFF5ED6A0;
+    private static final int DANGER = 0xFFE5766B;
     private static final int[] GROUP = {
         0xFFE5766B, 0xFFE8B05C, 0xFF8FCB6A, 0xFF5DBFB4, 0xFF6C9BE8, 0xFFB58CE0
     };
 
-    private static final String[] TOOL_LABEL = {"Center", "Group", "Pin", "Remove", "Preview"};
+    private final String[] toolLabel;
 
     private final float density;
     private Appearance ap = Appearance.defaults();
     private Appearance.Palette pal = ap.pal;
-    private BitmapShader tileShader;
-    private final Matrix tileMatrix = new Matrix();
-    private final Paint tilePaint = new Paint(Paint.FILTER_BITMAP_FLAG);
-    private final Paint bgPaint = new Paint(Paint.FILTER_BITMAP_FLAG);
     private final IconCache icons;
     private final ThumbCache thumbs;
     private Host host;
 
     private float[] list = new float[4096];
-    private float[] dots = new float[2048];
     private int tableVersion = Integer.MIN_VALUE;
     private final ArrayList<String> keys = new ArrayList<>();
     private final ArrayList<String> labels = new ArrayList<>();
-    private final ArrayList<Boolean> available = new ArrayList<>();
-    private final String[] slotKeys = new String[5];
+    /** Package of each card, computed once per string table instead of once per card per frame. */
+    private final ArrayList<String> pkgs = new ArrayList<>();
+    private int slotCount = 5;
+    private final String[] slotKeys = new String[MAX_SLOTS];
+    private final int[] folderIds = new int[MAX_SLOTS];
+    private final int[] folderSizes = new int[MAX_SLOTS];
+    private final String[][] folderIcons = new String[MAX_SLOTS][4];
 
     private int insetL, insetT, insetR, insetB;
     private final ArrayList<String> pendingEvents = new ArrayList<>();
     private final Runnable deliverEvents = this::deliver;
 
-    private final Paint dotPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    // ---- paints and scratch objects, all created once ----
     private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint stroke = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint cardPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint cardDragPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint shadowPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint centered = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint left = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint bitmapPaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
+    private final Paint previewPaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
+    private final Paint bgPaint = new Paint(Paint.FILTER_BITMAP_FLAG);
+    private final Paint tilePaint = new Paint(Paint.FILTER_BITMAP_FLAG);
+    private final Paint dotPaint = new Paint(Paint.FILTER_BITMAP_FLAG);
+    private final DashPathEffect dash = new DashPathEffect(new float[] {4f, 4f}, 0f);
     private final RectF r = new RectF();
     private final RectF r2 = new RectF();
-    private final android.graphics.Rect srcRect = new android.graphics.Rect();
-    private final Path path = new Path();
+    private final Rect srcRect = new Rect();
+    private final Path stripPath = new Path();
+    private final float[] stripRadii = new float[8];
+    private final Matrix tileMatrix = new Matrix();
+    private final Matrix dotMatrix = new Matrix();
+    private final Matrix previewMatrix = new Matrix();
+
+    private BitmapShader tileShader;
+    private Bitmap dotTile;
+    private BitmapShader dotShader;
+    private int dotTileP;
+    private float dotTileR;
+    private int dotTileColor;
 
     CanvasView(Context context, IconCache icons, ThumbCache thumbs) {
         super(context);
@@ -98,13 +124,15 @@ final class CanvasView extends View {
         density = context.getResources().getDisplayMetrics().density;
         setFocusable(true);
         setFocusableInTouchMode(false);
+        toolLabel = new String[] {
+            context.getString(R.string.tool_center), context.getString(R.string.tool_group),
+            context.getString(R.string.tool_pin), context.getString(R.string.tool_remove),
+            context.getString(R.string.tool_preview)};
+        Arrays.fill(folderIds, -1);
 
-        dotPaint.setStyle(Paint.Style.STROKE);
-        dotPaint.setStrokeCap(Paint.Cap.ROUND);
         stroke.setStyle(Paint.Style.STROKE);
         stroke.setStrokeCap(Paint.Cap.ROUND);
-        cardPaint.setShadowLayer(8f * density, 0f, 3f * density, 0x66000000);
-        cardDragPaint.setShadowLayer(18f * density, 0f, 8f * density, 0x99000000);
+        shadowPaint.setStyle(Paint.Style.FILL);
         centered.setTextAlign(Paint.Align.CENTER);
         left.setTextAlign(Paint.Align.LEFT);
         applyAppearance();
@@ -125,7 +153,6 @@ final class CanvasView extends View {
     }
 
     private void applyAppearance() {
-        dotPaint.setColor(ap.dot);
         cardPaint.setColor(pal.card);
         cardDragPaint.setColor(pal.cardDrag);
         centered.setColor(pal.text);
@@ -142,6 +169,15 @@ final class CanvasView extends View {
         insetR = rr;
         insetB = b;
         pushViewport();
+    }
+
+    /** Folder id shown in this dock slot, or -1. */
+    int folderIdAtSlot(int slot) {
+        return slot >= 0 && slot < MAX_SLOTS ? folderIds[slot] : -1;
+    }
+
+    int slotCount() {
+        return slotCount;
     }
 
     @Override protected void onSizeChanged(int w, int h, int ow, int oh) {
@@ -170,8 +206,6 @@ final class CanvasView extends View {
                 for (int i = 0; i < e.getPointerCount(); i++) send(1, e, i, t);
                 break;
             case MotionEvent.ACTION_POINTER_UP:
-                send(2, e, e.getActionIndex(), t);
-                break;
             case MotionEvent.ACTION_UP:
                 send(2, e, e.getActionIndex(), t);
                 break;
@@ -181,7 +215,8 @@ final class CanvasView extends View {
             default:
                 return true;
         }
-        invalidate();
+        // Tied to the next frame: several MOVE events between two frames end up as one redraw.
+        postInvalidateOnAnimation();
         return true;
     }
 
@@ -192,32 +227,34 @@ final class CanvasView extends View {
     // ---- drawing ---------------------------------------------------------------
 
     @Override protected void onDraw(Canvas c) {
+        long t0 = System.nanoTime();
         boolean more = Native.tick(SystemClock.uptimeMillis());
         int n = Native.render(list);
         if (n > list.length) {
             list = new float[n + 2048];
             n = Native.render(list);
         }
+        long t1 = System.nanoTime();
+        PerfStats.NATIVE_RENDER.add(t1 - t0, PerfStats.FRAME_BUDGET_NS);
         if (n < HEADER) {
             c.drawColor(ap.bg);
             return;
         }
-        drawBackground(c);
         int version = (int) list[0];
         if (version != tableVersion) {
             refreshTable();
             tableVersion = version;
         }
-
-        float d = density;
-        c.save();
-        c.scale(d, d);
+        drawBackground(c);
         if (ap.source != Appearance.SOURCE_IMAGE) drawDots(c); // a picture replaces colours and dots
+
         int nCards = (int) list[6];
         int nLinks = (int) list[7];
         int nUi = (int) list[8];
         int linkBase = HEADER + nCards * CARD_STRIDE;
         int uiBase = linkBase + nLinks * LINK_STRIDE;
+        c.save();
+        c.scale(density, density);
         drawLinks(c, linkBase, nLinks);
         for (int i = 0; i < nCards; i++) {
             drawCard(c, HEADER + i * CARD_STRIDE);
@@ -234,6 +271,8 @@ final class CanvasView extends View {
         if (more) {
             postInvalidateOnAnimation();
         }
+        PerfStats.JAVA_DRAW.add(System.nanoTime() - t1, PerfStats.FRAME_BUDGET_NS);
+        PerfStats.frameDrawn();
     }
 
     private void deliver() {
@@ -247,8 +286,11 @@ final class CanvasView extends View {
     private void refreshTable() {
         keys.clear();
         labels.clear();
-        available.clear();
+        pkgs.clear();
         Arrays.fill(slotKeys, null);
+        Arrays.fill(folderIds, -1);
+        Arrays.fill(folderSizes, 0);
+        for (String[] f : folderIcons) Arrays.fill(f, null);
         String table = Native.stringTable();
         if (table == null) return;
         for (String line : table.split("\n")) {
@@ -256,19 +298,35 @@ final class CanvasView extends View {
             if (p.length >= 4 && p[0].equals("c")) {
                 keys.add(p[1]);
                 labels.add(p[2]);
-                available.add(p[3].equals("1"));
+                pkgs.add(ThumbStore.packageOf(p[1]));
             } else if (p.length >= 3 && p[0].equals("d")) {
-                try {
-                    int slot = Integer.parseInt(p[1]);
-                    if (slot >= 0 && slot < slotKeys.length) slotKeys[slot] = p[2];
-                } catch (NumberFormatException ignored) {
-                    // malformed record: leave the slot empty
+                int slot = parse(p[1]);
+                if (slot >= 0 && slot < MAX_SLOTS) slotKeys[slot] = p[2];
+            } else if (p.length >= 9 && p[0].equals("f")) {
+                // f, slot, id, name, count, k1..k4
+                int slot = parse(p[1]);
+                if (slot >= 0 && slot < MAX_SLOTS) {
+                    folderIds[slot] = parse(p[2]);
+                    folderSizes[slot] = Math.max(0, parse(p[4]));
+                    for (int i = 0; i < 4; i++) folderIcons[slot][i] = p[5 + i].isEmpty() ? null : p[5 + i];
                 }
+            } else if (p.length >= 2 && p[0].equals("p")) {
+                int cnt = parse(p[1]);
+                if (cnt >= 3 && cnt <= MAX_SLOTS) slotCount = cnt;
             }
         }
     }
 
-    /** Plain colour, a picture fixed to the screen, or a picture tiled on the canvas. */
+    private static int parse(String s) {
+        try {
+            return Integer.parseInt(s.trim());
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    // ---- background ------------------------------------------------------------
+
     private void drawBackground(Canvas c) {
         Bitmap bmp = ap.source == Appearance.SOURCE_IMAGE ? ap.bitmap : null;
         if (bmp == null) {
@@ -298,10 +356,9 @@ final class CanvasView extends View {
     }
 
     /**
-     * Pinned to the canvas: one bitmap pixel is one screen pixel at zoom 1, the grid starts at the
-     * canvas origin like the dots do, so panning moves it with the cards and zooming scales it.
-     * The origin arrives as high + low floats and is reduced modulo the tile in double precision,
-     * so the picture does not jitter far from the origin.
+     * Pinned to the canvas: the grid starts at the canvas origin like the dots do, so panning moves
+     * it with the cards and zooming scales it. The origin arrives as high + low floats and is
+     * reduced modulo the tile in double precision, so the picture does not jitter far from the origin.
      */
     private void drawTiled(Canvas c, Bitmap bmp) {
         float zoom = list[1];
@@ -313,37 +370,55 @@ final class CanvasView extends View {
         }
         double ox = ((double) list[17] + list[18]) * density;
         double oy = ((double) list[19] + list[20]) * density;
-        double tx = ox % pitchX;
-        double ty = oy % pitchY;
         tileMatrix.setScale(zoom, zoom);
-        tileMatrix.postTranslate((float) tx, (float) ty);
+        tileMatrix.postTranslate((float) (ox % pitchX), (float) (oy % pitchY));
         tileShader.setLocalMatrix(tileMatrix);
+        // Since Android 10 a changed local matrix only reaches the paint when the shader is set again.
+        tilePaint.setShader(tileShader);
         c.drawRect(0f, 0f, getWidth(), getHeight(), tilePaint);
     }
 
+    /**
+     * The dot grid is one small tile (a single dot) repeated by a BitmapShader. The tile is
+     * rebuilt only when the pitch, dot size or colour changed noticeably; between rebuilds the
+     * shader matrix scales and offsets it so the grid stays glued to the canvas while panning
+     * and zooming. Drawn in device pixels.
+     */
     private void drawDots(Canvas c) {
-        float spacing = list[2];
-        if (spacing < 1f) return;
-        float ox = list[3];
-        float oy = list[4];
-        dotPaint.setStrokeWidth(list[5] * 2f);
-        float vw = getWidth() / density;
-        float vh = getHeight() / density;
-        int cols = (int) ((vw - ox) / spacing) + 1;
-        int rows = (int) ((vh - oy) / spacing) + 1;
-        if (cols <= 0 || rows <= 0) return;
-        int count = cols * rows;
-        if (dots.length < count * 2) dots = new float[count * 2 + 512];
-        int k = 0;
-        for (int row = 0; row < rows; row++) {
-            float y = oy + row * spacing;
-            for (int col = 0; col < cols; col++) {
-                dots[k++] = ox + col * spacing;
-                dots[k++] = y;
+        float spacingDp = list[2];
+        if (spacingDp < 1f) return;
+        float pitch = spacingDp * density;
+        float rPx = list[5] * density;
+        int p = dotTileP;
+        float s = p > 0 ? pitch / p : 0f;
+        boolean stale = dotTile == null || dotTileColor != ap.dot || s < 0.92f || s > 1.08f
+            || Math.abs(dotTileR * s - rPx) > 0.35f;
+        if (stale) {
+            p = Math.max(4, Math.round(pitch));
+            if (p > 2048) return;
+            if (dotTile == null || dotTile.getWidth() != p) {
+                dotTile = Bitmap.createBitmap(p, p, Bitmap.Config.ARGB_8888);
+                dotShader = new BitmapShader(dotTile, Shader.TileMode.REPEAT, Shader.TileMode.REPEAT);
+            } else {
+                dotTile.eraseColor(0);
             }
+            Canvas tc = new Canvas(dotTile);
+            fill.setColor(ap.dot);
+            float tr = Math.max(0.6f, rPx * p / pitch);
+            tc.drawCircle(p / 2f, p / 2f, tr, fill);
+            dotTileP = p;
+            dotTileR = tr;
+            dotTileColor = ap.dot;
+            s = pitch / p;
         }
-        c.drawPoints(dots, 0, k, dotPaint);
+        dotMatrix.setScale(s, s);
+        dotMatrix.postTranslate(list[3] * density - dotTileP * s / 2f, list[4] * density - dotTileP * s / 2f);
+        dotShader.setLocalMatrix(dotMatrix);
+        dotPaint.setShader(dotShader);
+        c.drawRect(0f, 0f, getWidth(), getHeight(), dotPaint);
     }
+
+    // ---- cards -----------------------------------------------------------------
 
     private void drawLinks(Canvas c, int base, int n) {
         stroke.setColor((pal.accent & 0x00FFFFFF) | 0x66000000);
@@ -368,6 +443,12 @@ final class CanvasView extends View {
 
         float rad = Math.min(w, h) * 0.16f;
         r.set(x, y, x + w, y + h);
+        // One translucent rounded shape under the card instead of a blurred shadow layer.
+        float grow = dragging ? 3f : 1f;
+        float dy = dragging ? 6f : 2f;
+        shadowPaint.setColor(dragging ? 0x55000000 : 0x40000000);
+        r2.set(x - grow, y - grow + dy, x + w + grow, y + h + grow + dy);
+        c.drawRoundRect(r2, rad + grow, rad + grow, shadowPaint);
         c.drawRoundRect(r, rad, rad, dragging ? cardDragPaint : cardPaint);
 
         int border = pal.stroke;
@@ -388,15 +469,15 @@ final class CanvasView extends View {
         stroke.setStrokeWidth(bw);
         c.drawRoundRect(r, rad, rad, stroke);
 
-        String key = idx >= 0 && idx < keys.size() ? keys.get(idx) : null;
-        String label = idx >= 0 && idx < labels.size() ? labels.get(idx) : "";
+        boolean ok = idx >= 0 && idx < keys.size();
+        String key = ok ? keys.get(idx) : null;
+        String label = ok ? labels.get(idx) : "";
 
         int alpha = unavailable ? 90 : 255;
-        Bitmap shot = key == null || (flags & CARD_NO_PREVIEW) != 0 ? null : thumbs.get(ThumbStore.packageOf(key));
+        ThumbCache.Thumb shot = !ok || (flags & CARD_NO_PREVIEW) != 0 ? null : thumbs.get(pkgs.get(idx));
         Bitmap icon = key == null ? null : icons.get(key);
         if (shot != null) {
             drawPreview(c, shot, x, y, w, h, rad, alpha);
-            // Small icon badge and a label strip keep the app identifiable.
             float badge = Math.min(w * 0.26f, 26f);
             if (icon != null && badge >= 8f) {
                 fill.setColor(pal.scrim);
@@ -408,18 +489,19 @@ final class CanvasView extends View {
             float ts = Math.min(h * 0.075f, w * 0.14f);
             if (ts >= 6.5f) {
                 float strip = ts * 2.1f;
+                // The strip is its own path with rounded bottom corners: no clipping needed.
+                stripRadii[4] = rad;
+                stripRadii[5] = rad;
+                stripRadii[6] = rad;
+                stripRadii[7] = rad;
+                stripPath.rewind();
                 r2.set(x, y + h - strip, x + w, y + h);
+                stripPath.addRoundRect(r2, stripRadii, Path.Direction.CW);
                 fill.setColor(pal.strip);
-                c.save();
-                path.rewind();
-                path.addRoundRect(r, rad, rad, Path.Direction.CW);
-                c.clipPath(path);
-                c.drawRect(r2, fill);
-                c.restore();
+                c.drawPath(stripPath, fill);
                 drawLabel(c, label, x, w, y + h - strip + ts * 1.45f, ts, unavailable ? pal.textDim : pal.text);
             }
         } else {
-            // No preview captured yet: icon + name, centered.
             float iconSize = Math.min(w * 0.56f, h * 0.56f);
             float ix = x + (w - iconSize) / 2f;
             float ts = Math.min(h * 0.125f, w * 0.14f);
@@ -438,44 +520,46 @@ final class CanvasView extends View {
             }
         }
         if (unavailable) {
-            // Uninstalled/disabled app: keep the card, mark it, let the user remove it.
             float br = Math.max(5f, w * 0.1f);
-            fill.setColor(0xFFE5766B);
-            c.drawCircle(x + w - br - 3f, y + br + 3f, br, fill);
-            fill.setColor(pal.ink);
+            float cx = x + w - br - 3f;
+            float cy = y + br + 3f;
+            fill.setColor(DANGER);
+            c.drawCircle(cx, cy, br, fill);
             float s = br * 0.45f;
             stroke.setColor(pal.ink);
             stroke.setStrokeWidth(Math.max(1.2f, br * 0.22f));
-            float cx = x + w - br - 3f;
-            float cy = y + br + 3f;
             c.drawLine(cx - s, cy - s, cx + s, cy + s, stroke);
             c.drawLine(cx - s, cy + s, cx + s, cy - s, stroke);
         }
     }
 
-    /** Draws the preview center-cropped (top-aligned) into the card, clipped to its rounded rect. */
-    private void drawPreview(Canvas c, Bitmap shot, float x, float y, float w, float h, float rad, int alpha) {
+    /**
+     * Preview center-cropped (top-aligned) into the card with rounded corners through a
+     * BitmapShader: the rounded rect is the clip, so no clipPath and no offscreen layer.
+     */
+    private void drawPreview(Canvas c, ThumbCache.Thumb thumb, float x, float y, float w, float h, float rad, int alpha) {
+        Bitmap shot = thumb.bitmap;
         float bw = shot.getWidth();
         float bh = shot.getHeight();
         float cardAspect = w / h;
-        int sw;
-        int sh;
-        if (bw / bh > cardAspect) { // image wider than the card: trim the sides
-            sh = (int) bh;
-            sw = Math.max(1, Math.round(bh * cardAspect));
-        } else { // taller than the card: keep the top, trim the bottom
-            sw = (int) bw;
-            sh = Math.max(1, Math.round(bw / cardAspect));
+        float sw;
+        float sx;
+        if (bw / bh > cardAspect) {
+            sw = bh * cardAspect;
+            sx = (bw - sw) / 2f;
+        } else {
+            sw = bw;
+            sx = 0f;
         }
-        srcRect.set((int) ((bw - sw) / 2f), 0, (int) ((bw - sw) / 2f) + sw, sh);
+        float k = w / sw;
+        previewMatrix.setScale(k, k);
+        previewMatrix.postTranslate(x - sx * k, y);
+        BitmapShader sh = thumb.shader();
+        sh.setLocalMatrix(previewMatrix);
+        previewPaint.setShader(sh);
+        previewPaint.setAlpha(alpha);
         r2.set(x, y, x + w, y + h);
-        c.save();
-        path.rewind();
-        path.addRoundRect(r2, rad, rad, Path.Direction.CW);
-        c.clipPath(path);
-        bitmapPaint.setAlpha(alpha);
-        c.drawBitmap(shot, srcRect, r2, bitmapPaint);
-        c.restore();
+        c.drawRoundRect(r2, rad, rad, previewPaint);
     }
 
     /** Single-line label; ellipsized without allocating. */
@@ -495,6 +579,8 @@ final class CanvasView extends View {
         c.drawText(text, 0, count, x0, baseline, left);
         c.drawText("…", x0 + left.measureText(text, 0, count), baseline, left);
     }
+
+    // ---- screen-fixed interface -------------------------------------------------
 
     private void drawUi(Canvas c, int base, int n) {
         float px = list[9], py = list[10], pw = list[11], ph = list[12];
@@ -540,15 +626,20 @@ final class CanvasView extends View {
 
         if (dockDragSlot >= 0f && slotSize > 0f) {
             int from = (int) dockDragSlot;
-            String key = from < slotKeys.length ? slotKeys[from] : null;
-            Bitmap icon = key == null ? null : icons.get(key);
             float s = slotSize * 1.1f;
             float cx = dockDragX;
             float cy = py + ph / 2f;
-            if (icon != null) {
-                bitmapPaint.setAlpha(255);
-                r2.set(cx - s / 2f, cy - s / 2f, cx + s / 2f, cy + s / 2f);
-                c.drawBitmap(icon, null, r2, bitmapPaint);
+            if (from < MAX_SLOTS && folderIds[from] >= 0) {
+                r.set(cx - s / 2f, cy - s / 2f, cx + s / 2f, cy + s / 2f);
+                drawFolderTile(c, from, 1f);
+            } else {
+                String key = from < MAX_SLOTS ? slotKeys[from] : null;
+                Bitmap icon = key == null ? null : icons.get(key);
+                if (icon != null) {
+                    bitmapPaint.setAlpha(255);
+                    r2.set(cx - s / 2f, cy - s / 2f, cx + s / 2f, cy + s / 2f);
+                    c.drawBitmap(icon, null, r2, bitmapPaint);
+                }
             }
         }
     }
@@ -558,14 +649,18 @@ final class CanvasView extends View {
         boolean pressed = (flags & UI_PRESSED) != 0;
         boolean filled = (flags & UI_FILLED) != 0;
         float cx = r.centerX(), cy = r.centerY();
-        float s = r.width() * (pressed ? 0.8f : 0.9f);
+        float w = r.width();
+        float s = w * (pressed ? 0.8f : 0.9f);
         if ((flags & UI_DRAG_OVER) != 0) {
             stroke.setColor(pal.accent);
             stroke.setStrokeWidth(2f);
-            c.drawRoundRect(r, r.width() * 0.28f, r.width() * 0.28f, stroke);
+            c.drawRoundRect(r, w * 0.28f, w * 0.28f, stroke);
         }
-        if (filled) {
-            String key = slot < slotKeys.length ? slotKeys[slot] : null;
+        if ((flags & UI_FOLDER) != 0 && slot >= 0 && slot < MAX_SLOTS) {
+            r.set(cx - s / 2f, cy - s / 2f, cx + s / 2f, cy + s / 2f);
+            drawFolderTile(c, slot, (flags & UI_DRAG_SOURCE) != 0 ? 0.3f : 1f);
+        } else if (filled) {
+            String key = slot >= 0 && slot < MAX_SLOTS ? slotKeys[slot] : null;
             Bitmap icon = key == null ? null : icons.get(key);
             bitmapPaint.setAlpha((flags & UI_DRAG_SOURCE) != 0 ? 70 : 255);
             if (icon != null) {
@@ -579,14 +674,55 @@ final class CanvasView extends View {
             // Empty slot: dashed outline with a plus; tapping it opens the app list.
             stroke.setColor(pal.textDim);
             stroke.setStrokeWidth(1.3f);
-            stroke.setPathEffect(new DashPathEffect(new float[] {4f, 4f}, 0f));
-            float inset = r.width() * 0.1f;
+            stroke.setPathEffect(dash);
+            float inset = w * 0.1f;
             r2.set(r.left + inset, r.top + inset, r.right - inset, r.bottom - inset);
             c.drawRoundRect(r2, r2.width() * 0.3f, r2.width() * 0.3f, stroke);
             stroke.setPathEffect(null);
-            float a = r.width() * 0.16f;
+            float a = w * 0.16f;
             c.drawLine(cx - a, cy, cx + a, cy, stroke);
             c.drawLine(cx, cy - a, cx, cy + a, stroke);
+        }
+    }
+
+    /** A folder in the dock: a rounded tile with up to four mini icons, or a "+" when it is empty. r = the tile. */
+    private void drawFolderTile(Canvas c, int slot, float alphaScale) {
+        float w = r.width();
+        int a = Math.round(255 * alphaScale);
+        float rad = w * 0.3f;
+        fill.setColor(pal.card);
+        fill.setAlpha(a);
+        c.drawRoundRect(r, rad, rad, fill);
+        stroke.setColor((pal.accent & 0x00FFFFFF) | (Math.round(0xAA * alphaScale) << 24));
+        stroke.setStrokeWidth(1.4f);
+        c.drawRoundRect(r, rad, rad, stroke);
+        float cx = r.centerX();
+        float cy = r.centerY();
+        if (folderSizes[slot] == 0) {
+            float k = w * 0.2f;
+            stroke.setStrokeWidth(Math.max(1.6f, w * 0.06f));
+            c.drawLine(cx - k, cy, cx + k, cy, stroke);
+            c.drawLine(cx, cy - k, cx, cy + k, stroke);
+            return;
+        }
+        float cell = w * 0.36f;
+        float gap = w * 0.06f;
+        float x0 = cx - cell - gap / 2f;
+        float y0 = cy - cell - gap / 2f;
+        bitmapPaint.setAlpha(a);
+        for (int i = 0; i < 4; i++) {
+            String key = folderIcons[slot][i];
+            if (key == null) continue;
+            float ix = x0 + (i % 2) * (cell + gap);
+            float iy = y0 + (i / 2) * (cell + gap);
+            Bitmap icon = icons.get(key);
+            if (icon != null) {
+                r2.set(ix, iy, ix + cell, iy + cell);
+                c.drawBitmap(icon, null, r2, bitmapPaint);
+            } else {
+                fill.setColor(pal.placeholder);
+                c.drawCircle(ix + cell / 2f, iy + cell / 2f, cell / 2f, fill);
+            }
         }
     }
 
@@ -611,7 +747,6 @@ final class CanvasView extends View {
         stroke.setColor(pal.text);
         stroke.setStrokeWidth(1.8f);
         if (kind == 2) {
-            // Overview: four corner brackets.
             float a = rad * 0.55f, k = rad * 0.28f;
             for (int sx = -1; sx <= 1; sx += 2) {
                 for (int sy = -1; sy <= 1; sy += 2) {
@@ -621,7 +756,6 @@ final class CanvasView extends View {
                 }
             }
         } else {
-            // Recent: clock face.
             float a = rad * 0.5f;
             c.drawCircle(cx, cy, a, stroke);
             c.drawLine(cx, cy, cx, cy - a * 0.65f, stroke);
@@ -635,17 +769,17 @@ final class CanvasView extends View {
         c.drawRoundRect(r, rad, rad, fill);
         boolean remove = tool == 3;
         boolean preview = tool == 4;
-        int accent = remove ? 0xFFE5766B : (preview ? (on ? pal.accent : pal.textDim) : pal.text);
-        stroke.setColor(remove ? 0xFFE5766B : (preview && on ? pal.accent : pal.stroke));
+        int accent = remove ? DANGER : (preview ? (on ? pal.accent : pal.textDim) : pal.text);
+        stroke.setColor(remove ? DANGER : (preview && on ? pal.accent : pal.stroke));
         stroke.setStrokeWidth(1f);
         c.drawRoundRect(r, rad, rad, stroke);
         centered.setTextSize(12f);
         centered.setColor(accent);
         float ty = r.centerY() + 4.2f;
-        c.drawText(TOOL_LABEL[tool], r.centerX(), ty, centered);
+        String label = toolLabel[tool];
+        c.drawText(label, r.centerX(), ty, centered);
         if (preview && !on) {
-            // Preview hidden for this card: strike the label through.
-            float half = centered.measureText(TOOL_LABEL[tool]) / 2f;
+            float half = centered.measureText(label) / 2f;
             stroke.setColor(pal.textDim);
             stroke.setStrokeWidth(1.4f);
             c.drawLine(r.centerX() - half, ty - 3.6f, r.centerX() + half, ty - 3.6f, stroke);

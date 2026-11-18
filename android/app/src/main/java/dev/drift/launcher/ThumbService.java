@@ -14,7 +14,6 @@ import android.view.Display;
 import android.view.accessibility.AccessibilityEvent;
 
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 
 /**
  * Captures a still preview of the app in front, for the cards on the canvas.
@@ -33,20 +32,32 @@ public final class ThumbService extends AccessibilityService {
     private static final long MIN_INTERVAL_MS = 1300;
 
     private final Handler main = new Handler(Looper.getMainLooper());
-    private final ExecutorService io = Executors.newSingleThreadExecutor();
+    private final ExecutorService io = Workers.single("drift-shots", android.os.Process.THREAD_PRIORITY_BACKGROUND);
     private final Runnable shoot = this::capture;
     private volatile String front;
     private long lastShot;
 
+    /**
+     * Whether the user has switched this service on. The system stores components as
+     * "pkg/pkg.Class", but some firmware writes the short form "pkg/.Class" (and other
+     * services in the list may be malformed), so every entry is parsed into a ComponentName
+     * (which expands the short form) and compared as a component, not as text.
+     */
     static boolean isEnabled(Context ctx) {
-        String enabled = Settings.Secure.getString(ctx.getContentResolver(),
-            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
-        if (enabled == null) return false;
-        String me = new ComponentName(ctx, ThumbService.class).flattenToString();
+        return isListed(Settings.Secure.getString(ctx.getContentResolver(),
+            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES), new ComponentName(ctx, ThumbService.class));
+    }
+
+    /** Pure parsing part of {@link #isEnabled}; {@code enabled} is the ':'-separated system setting. */
+    static boolean isListed(String enabled, ComponentName me) {
+        if (enabled == null || enabled.isEmpty()) return false;
         TextUtils.SimpleStringSplitter split = new TextUtils.SimpleStringSplitter(':');
         split.setString(enabled);
         while (split.hasNext()) {
-            if (me.equalsIgnoreCase(split.next())) return true;
+            String entry = split.next().trim();
+            if (entry.isEmpty()) continue;
+            ComponentName cn = ComponentName.unflattenFromString(entry);
+            if (cn != null && cn.equals(me)) return true;
         }
         return false;
     }

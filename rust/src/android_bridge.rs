@@ -10,7 +10,9 @@ use std::sync::Mutex;
 
 use jni::JNIEnv;
 use jni::objects::{JClass, JFloatArray, JObjectArray, JString};
-use jni::sys::{jboolean, jfloat, jint, jlong, jobjectArray, jstring};
+use jni::sys::{jboolean, jfloat, jint, jintArray, jlong, jobjectArray, jstring};
+
+use crate::dock::{FolderAdd, ResizePlan};
 
 use crate::drawer::AppEntry;
 use crate::launcher::Launcher;
@@ -47,12 +49,21 @@ impl Bridge {
     /// Render and copy into `dst`. Returns the display-list length; when it is
     /// larger than `dst.len()` nothing was copied and the caller must grow.
     pub fn render_into(&mut self, dst: &mut [f32]) -> usize {
-        self.launcher.render(&mut self.scratch);
-        let n = self.scratch.len();
+        let n = self.render_scratch();
         if n <= dst.len() {
             dst[..n].copy_from_slice(&self.scratch);
         }
         n
+    }
+
+    /// Build the display list into the internal buffer; returns its length.
+    pub fn render_scratch(&mut self) -> usize {
+        self.launcher.render(&mut self.scratch);
+        self.scratch.len()
+    }
+
+    pub fn scratch(&self) -> &[f32] {
+        &self.scratch
     }
 
     /// Serialized state to write, if anything is worth writing.
@@ -194,6 +205,8 @@ pub extern "system" fn Java_dev_drift_launcher_Native_resetClock(_env: JNIEnv, _
 }
 
 /// Fills `dst` with the display list and returns its length (see `Bridge::render_into`).
+/// One render per call: the list is built once into the bridge's scratch buffer and copied
+/// straight into the Java array when it fits.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_drift_launcher_Native_render(
     env: JNIEnv,
@@ -201,20 +214,13 @@ pub extern "system" fn Java_dev_drift_launcher_Native_render(
     dst: JFloatArray,
 ) -> jint {
     let cap = env.get_array_length(&dst).unwrap_or(0).max(0) as usize;
-    let mut local = vec![0f32; 0];
     let n = with(0usize, |b| {
-        // Render into the bridge scratch first; copy out only when it fits.
-        let mut probe = [0f32; 0];
-        let len = b.render_into(&mut probe);
-        if len <= cap {
-            local.resize(len, 0.0);
-            b.render_into(&mut local);
+        let len = b.render_scratch();
+        if len <= cap && len > 0 {
+            let _ = env.set_float_array_region(&dst, 0, b.scratch());
         }
         len
     });
-    if n <= cap && n > 0 {
-        let _ = env.set_float_array_region(&dst, 0, &local);
-    }
     n as jint
 }
 
@@ -311,10 +317,177 @@ pub extern "system" fn Java_dev_drift_launcher_Native_dockReplace(
     with((), |b| b.launcher.dock_replace(slot.max(0) as usize));
 }
 
+/// Load the saved workspace only when nothing is loaded yet (a screen other than the home
+/// screen may be the first to run after the process was recreated). Same codes as `init`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_drift_launcher_Native_ensureInit(
+    env: JNIEnv,
+    c: JClass,
+    path: JString,
+) -> jint {
+    let loaded = BRIDGE.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+    if loaded {
+        return 1;
+    }
+    Java_dev_drift_launcher_Native_init(env, c, path)
+}
+
+/// Turn a dock slot into a folder; returns the folder id, or -1.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_drift_launcher_Native_dockCreateFolder(
+    _env: JNIEnv,
+    _c: JClass,
+    slot: jint,
+) -> jint {
+    with(-1, |b| {
+        b.launcher
+            .dock_create_folder(slot.max(0) as usize)
+            .map_or(-1, |id| id as jint)
+    })
+}
+
+/// Add an installed app to a folder through the core (which also moves it out of any
+/// other dock place). 0 added, 1 already in the folder, 2 no such folder, 3 not installed.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_drift_launcher_Native_dockAddApp(
+    mut env: JNIEnv,
+    _c: JClass,
+    folder: jint,
+    key: JString,
+) -> jint {
+    let key = jstr(&mut env, &key);
+    with(2, |b| match b.launcher.dock_add_app(folder.max(0) as u32, &key) {
+        FolderAdd::Added => 0,
+        FolderAdd::AlreadyInFolder => 1,
+        FolderAdd::NoSuchFolder => 2,
+        FolderAdd::NotInstalled => 3,
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_drift_launcher_Native_dockRemoveApp(
+    mut env: JNIEnv,
+    _c: JClass,
+    folder: jint,
+    key: JString,
+) -> jboolean {
+    let key = jstr(&mut env, &key);
+    with(false, |b| b.launcher.dock_remove_app(folder.max(0) as u32, &key)).into()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_drift_launcher_Native_dockMoveApp(
+    _env: JNIEnv,
+    _c: JClass,
+    folder: jint,
+    from: jint,
+    to: jint,
+) -> jboolean {
+    with(false, |b| {
+        b.launcher
+            .dock_move_app(folder.max(0) as u32, from.max(0) as usize, to.max(0) as usize)
+    })
+    .into()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_drift_launcher_Native_dockRenameFolder(
+    mut env: JNIEnv,
+    _c: JClass,
+    folder: jint,
+    name: JString,
+) -> jboolean {
+    let name = jstr(&mut env, &name);
+    with(false, |b| b.launcher.dock_rename_folder(folder.max(0) as u32, &name)).into()
+}
+
+/// Apps of a folder in display order; null when the folder no longer exists.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_drift_launcher_Native_dockFolderApps(
+    mut env: JNIEnv,
+    _c: JClass,
+    folder: jint,
+) -> jobjectArray {
+    let Some(keys) = with(None, |b| b.launcher.dock_folder_apps(folder.max(0) as u32)) else {
+        return std::ptr::null_mut();
+    };
+    let Ok(string_class) = env.find_class("java/lang/String") else {
+        return std::ptr::null_mut();
+    };
+    let Ok(arr) = env.new_object_array(keys.len() as jint, string_class, JString::default()) else {
+        return std::ptr::null_mut();
+    };
+    for (i, k) in keys.iter().enumerate() {
+        if let Ok(s) = env.new_string(k) {
+            let _ = env.set_object_array_element(&arr, i as jint, &s);
+            let _ = env.delete_local_ref(s);
+        }
+    }
+    arr.into_raw()
+}
+
+/// The folder's own name (empty = default), or null when it no longer exists.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_drift_launcher_Native_dockFolderName(
+    env: JNIEnv,
+    _c: JClass,
+    folder: jint,
+) -> jstring {
+    match with(None, |b| b.launcher.dock_folder_name(folder.max(0) as u32)) {
+        Some(n) => env.new_string(n).map_or(std::ptr::null_mut(), |j| j.into_raw()),
+        None => std::ptr::null_mut(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_drift_launcher_Native_dockCount(_env: JNIEnv, _c: JClass) -> jint {
+    with(5, |b| b.launcher.dock.count() as jint)
+}
+
+fn plan_array(env: &JNIEnv, p: ResizePlan) -> jintArray {
+    let vals = [p.occupied_beyond as jint, p.moved as jint, p.lost_items as jint, p.lost_apps as jint];
+    match env.new_int_array(4) {
+        Ok(a) => {
+            let _ = env.set_int_array_region(&a, 0, &vals);
+            a.into_raw()
+        }
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// What changing the slot count would do: {occupied slots beyond, moved into free
+/// slots, items lost, apps lost}. Changes nothing.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_drift_launcher_Native_dockPlanResize(
+    env: JNIEnv,
+    _c: JClass,
+    count: jint,
+) -> jintArray {
+    let p = with(ResizePlan::default(), |b| b.launcher.dock_resize_plan(count.max(0) as usize));
+    plan_array(&env, p)
+}
+
+/// Apply a new slot count (the caller has confirmed any loss); returns the same plan.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_drift_launcher_Native_dockSetCount(
+    env: JNIEnv,
+    _c: JClass,
+    count: jint,
+) -> jintArray {
+    let p = with(ResizePlan::default(), |b| b.launcher.dock_set_count(count.max(0) as usize));
+    plan_array(&env, p)
+}
+
 /// Home pressed while the launcher is already showing.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_drift_launcher_Native_onHome(_env: JNIEnv, _c: JClass) {
     with((), |b| b.launcher.on_home());
+}
+
+/// Home pressed while the launcher is already in front.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_drift_launcher_Native_homePressed(_env: JNIEnv, _c: JClass) {
+    with((), |b| b.launcher.home_pressed());
 }
 
 /// Back pressed: true when something (a selection) was dismissed.
@@ -323,8 +496,34 @@ pub extern "system" fn Java_dev_drift_launcher_Native_onBack(_env: JNIEnv, _c: J
     with(false, |b| b.back()).into()
 }
 
-/// Write the workspace to disk. Serialization happens under the lock, the file
-/// write does not, so a slow disk never blocks touch handling.
+/// Serialized workspace, taken under the lock (cheap). The caller writes it with
+/// `writeSnapshot` on a background thread: fsync never runs on the UI thread.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_drift_launcher_Native_snapshot(env: JNIEnv, _c: JClass) -> jstring {
+    match with(None, |b| Some(b.snapshot_json())) {
+        Some(json) => env.new_string(json).map_or(std::ptr::null_mut(), |j| j.into_raw()),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Atomically write a snapshot (temp file, fsync, backup, rename). Takes the lock only to
+/// read the path, so a slow disk never blocks touch handling.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_drift_launcher_Native_writeSnapshot(
+    mut env: JNIEnv,
+    _c: JClass,
+    json: JString,
+) -> jboolean {
+    let json = jstr(&mut env, &json);
+    let path = with(None, |b| Some(b.path.clone()));
+    let ok = match path {
+        Some(p) if !json.is_empty() => persistence::write_atomic(&p, &json).is_ok(),
+        _ => false,
+    };
+    ok.into()
+}
+
+/// Snapshot and write in one call. Kept for callers that already run off the UI thread.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_drift_launcher_Native_save(_env: JNIEnv, _c: JClass) -> jboolean {
     let job = with(None, |b| Some((b.path.clone(), b.snapshot_json())));
@@ -379,7 +578,7 @@ mod tests {
         assert_eq!(again.load_source, LoadSource::Main);
         let restored: Vec<_> = again.launcher.cards.iter().map(|c| (c.key.clone(), c.rect)).collect();
         assert_eq!(positions, restored);
-        assert_eq!(again.launcher.dock.get(2), Some(k[1].as_str()));
+        assert_eq!(again.launcher.dock.app_at(2), Some(k[1].as_str()));
         // Restoring must not launch anything by itself.
         assert!(again.launcher.poll_event().is_none());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
