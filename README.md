@@ -1,76 +1,155 @@
 # DriftWM for Android
 
-An Android port of [DriftWM](https://github.com/malbiruk/driftwm), bringing its window management experience to Android devices
+**An infinite desktop experience for Android**
 
-## About
+DriftWM for Android is an independent community-developed port of [DriftWM](https://github.com/malbiruk/driftwm), bringing its desktop-inspired workspace concept to Android devices
 
-DriftWM for Android is a community-developed fork of the original DriftWM project, adapted to work on Android
+Instead of a traditional grid of application icons, DriftWM gives you an open workspace where you can arrange application cards, organize your dock, customize the appearance, and make the desktop your own
 
-The goal of this project is to bring the original project's features and design to Android while maintaining its core philosophy
+## Screenshots
+
+### Workspace
+
+Your desktop is an open workspace where application cards can be freely arranged
+
+![DriftWM Workspace](.github/screenshots/workspace.png)
+
+### Application List
+
+Browse installed applications and access them from the launcher
+
+![Application List](.github/screenshots/app_list.png)
+
+### Dock Folders
+
+Keep your dock organized with folders
+
+![Dock Folders](.github/screenshots/folder_in_dock.png)
+
+### Themes
+
+Choose from six built-in interface themes
+
+<p align="center">
+  <img src=".github/screenshots/Default_theme_1.png" width="32%" alt="Theme 1">
+  <img src=".github/screenshots/Default_theme_2.png" width="32%" alt="Theme 2">
+  <img src=".github/screenshots/Default_theme_3.png" width="32%" alt="Theme 3">
+</p>
+<p align="center">
+  <img src=".github/screenshots/Default_theme_4.png" width="32%" alt="Theme 4">
+  <img src=".github/screenshots/Default_theme_5.png" width="32%" alt="Theme 5">
+  <img src=".github/screenshots/Default_theme_6.png" width="32%" alt="Theme 6">
+</p>
+
+### Wallpapers
+
+Customize your desktop with static or dynamic wallpapers
+
+<p align="center">
+  <img src=".github/screenshots/pic_static.png" width="48%" alt="Static wallpaper">
+  <img src=".github/screenshots/pic_dinamic.png" width="48%" alt="Dynamic wallpaper">
+</p>
+
+### Settings
+
+Configure the launcher and customize its appearance
+
+<p align="center">
+  <img src=".github/screenshots/settings1.png" width="32%" alt="Settings 1">
+  <img src=".github/screenshots/settings2.png" width="32%" alt="Settings 2">
+  <img src=".github/screenshots/settings3.png" width="32%" alt="Settings 3">
+</p>
 
 ## Features
 
-- Android-compatible implementation
-- Adapted from the original DriftWM project
-- Tested on multiple real Android devices
+- **Infinite Workspace** — an open desktop where application cards can be freely positioned
+- **Application Cards** — visual representations of your apps with thumbnails
+- **Drag and Drop** — arrange cards and organize your workspace
+- **Dock Folders** — group applications into folders directly in the dock
+- **Customizable Dock** — choose between 3 and 8 dock slots
+- **Application List** — access your installed applications
+- **Themes** — six built-in interface themes
+- **Custom Wallpapers** — use your own images or choose a solid background
+- **Static and Dynamic Wallpapers** — configure how your desktop background behaves
+- **Interface Customization** — adjust the appearance and accent colors
+
+## Performance
+
+DriftWM is designed with performance in mind, including:
+
+- Optimized rendering and workspace updates
+- Cached application icons
+- Background processing for resource-intensive operations
+- Efficient state persistence
+- Reduced unnecessary application and system queries
+
+The project aims to remain usable on a wide range of Android devices
 
 ## Requirements
 
-- **Minimum:** Android 11 (API 30)
-- **Recommended:** Android 16 (API 36)
+- **Minimum Android version:** Android 11 (API 30)
+- **Recommended Android version:** Android 16 (API 36)
 - **Target SDK:** 36
 
-Android 11 and newer are supported, but Android 16 is recommended for the best experience
+Android 11 and newer are supported, although the experience may vary depending on the device and manufacturer
 
 ## Installation and Setup
 
-### Step 1: Install DriftWM and set it as the default launcher
+### 1. Install DriftWM
 
-1. Download the latest APK from the [Releases](../../releases/latest) page
+1. Download the latest APK from [GitHub Releases](../../releases/latest)
 2. Open the downloaded APK on your Android device
 3. Allow installation from this source if Android asks for permission
-4. Follow the on-screen instructions to install the application
-5. Open your phone's **Settings** and find **Default apps** (the exact name may vary by device)
-6. Open the **Home app** or **Default launcher** setting and select **Drift**
+4. Complete the installation
 
-If you cannot find the setting, use the search bar in your phone's Settings and search for **Default apps** or **Home app**
+### 2. Set DriftWM as your default launcher
 
-### Step 2: Enable Drift Preview for thumbnails
+1. Open your phone's **Settings**
+2. Find **Default apps**
+3. Open **Home app** or **Default launcher**
+4. Select **Drift**
+
+The exact menu names may vary depending on your Android version and device manufacturer
+
+### 3. Enable Drift Preview
+
+Drift Preview provides application thumbnails for the workspace
 
 1. Open your phone's **Settings**
 2. Find **Accessibility**
-3. Open the list of accessibility services and enable **Drift Preview**
+3. Open the list of accessibility services
+4. Enable **Drift Preview**
 
-The exact menu names may vary depending on your device
-
-**Note:** Drift Preview is only required for thumbnails. Enable it if you want to use the thumbnail feature; it is not required for the launcher itself
+**Note:** This service is optional and only required for the thumbnail functionality. The launcher itself works without it
 
 ## Download
 
 Get the latest version from [GitHub Releases](../../releases/latest)
 
-## Device Testing
+## Device Compatibility
 
-DriftWM for Android has been tested on multiple real Android devices. Compatibility and functionality may still vary depending on the Android version and device
+DriftWM has been tested on multiple real Android devices and different Android versions
+
+Compatibility may vary depending on the device manufacturer, Android version, and system-specific launcher or accessibility implementations
+
+If you encounter a problem, consider [opening an issue](../../issues) with information about your device and Android version
 
 ## Security Notice
 
-Drift is intended to be safe to use. However, your device's built-in security scanner or antivirus may occasionally display a warning during installation. This may be a false positive
+Only install APK files downloaded from this project's official [GitHub Releases](../../releases/latest) page
 
-Only install the APK downloaded from this project's official [GitHub Releases](../../releases/latest) page. If a security warning appears, verify that the APK came from the official release before deciding how to proceed
+Some device security scanners may occasionally display warnings during installation. Always verify that the APK comes from the official project repository
 
 ## Original Project
 
-This project is based on [DriftWM](https://github.com/malbiruk/driftwm), created by its original developers
+DriftWM for Android is based on the original [DriftWM](https://github.com/malbiruk/driftwm) project
 
-All credit for the original project goes to its respective authors
+The original project and its contributors deserve credit for the ideas and inspiration behind this port
 
 ## Disclaimer
 
 This is an independent community fork and is not an official release of the original DriftWM project
 
-Compatibility and functionality may vary depending on the Android version and device
-
 ## License
 
-Please refer to the [LICENSE](LICENSE) file for licensing terms
+See the [LICENSE](LICENSE) file for licensing information
