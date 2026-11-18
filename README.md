@@ -11,23 +11,23 @@ Instead of a traditional grid of application icons, DriftWM gives you an open wo
 ### Workspace
 
 Your desktop is an open workspace where application cards can be freely arranged
-<p>
-<img src=".github/screenshots/workspace.png" width="32%" alt="workspace">
+<p align="center">
+<img src=".github/screenshots/workspace.png" width="60%" alt="workspace">
 </p>
 ### Application List
 
 Browse installed applications and access them from the launcher
 
-<p>
-<img src=".github/screenshots/app_list.png" width="32%" alt="app_list">
+<p align="center">
+<img src=".github/screenshots/app_list.png" width="60%" alt="app_list">
 </p>
 
 ### Dock Folders
 
 Keep your dock organized with folders
 
-<p>
-<img src=".github/screenshots/folder_in_dock.png" width="32%" alt="folder_in_dock">
+<p align="center">
+<img src=".github/screenshots/folder_in_dock.png" width="60%" alt="folder_in_dock">
 </p>
 
 ### Themes
